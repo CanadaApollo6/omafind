@@ -1,0 +1,54 @@
+# app config for the billing sync daemon
+# values here can be overridden with BILLING_* environment variables
+
+[server]
+host = "0.0.0.0"
+port = 8080
+read_timeout_s = 15
+write_timeout_s = 30
+max_body_kb = 512
+
+[log]
+level = "info"        # debug, info, warn, error
+format = "json"
+file = "/var/log/billing/sync.log"
+rotate_mb = 50
+keep_files = 8
+
+[database]
+host = "db.internal.example"
+port = 5432
+name = "billing"
+user = "sync_app"
+pool_size = 10
+statement_timeout_ms = 5000
+# the password comes from BILLING_DB_PASSWORD, never put it here
+
+[sync]
+interval_minutes = 15
+batch_size = 500
+retry_limit = 4
+retry_backoff_s = 2
+currency = "USD"
+skip_weekends = false
+
+[sync.sources.bank_feed]
+enabled = true
+url = "https://feeds.example-bank.test/v1/transactions"
+timeout_s = 20
+
+[sync.sources.card_feed]
+enabled = true
+url = "https://cards.example-processor.test/export"
+timeout_s = 45
+verify_tls = true
+
+[sync.sources.legacy_csv]
+enabled = false
+path = "/srv/imports/legacy"
+# TODO: remove after the postgres migration is done
+
+[alerts]
+email = "ops-alerts@example.test"
+slack_webhook = ""
+quiet_hours = ["22:00", "06:30"]

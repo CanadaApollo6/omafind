@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "omafind.search",
+  "name": "Find",
+  "version": "0.1.0",
+  "author": "omafind",
+  "description": "Find files by what is in them: documents, code and photos, searched locally with omafind",
+  "kinds": [
+    "overlay"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "Find.qml"
+  }
+}

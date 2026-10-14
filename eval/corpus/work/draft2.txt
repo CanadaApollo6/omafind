@@ -1,0 +1,24 @@
+self review draft 2 (due Oct 25)
+
+Accomplishments this cycle
+
+1. Led the rewrite of the invoice export job. It was running 3 hours nightly and timing out. New version runs in 22 minutes and we haven't had a failed run since August. Worked with Dwayne on the S3 layout.
+2. Shipped the reconciliation dashboard for the finance team (Q2). Adoption is 14 of 17 users. Two holdouts are still on spreadsheets; meeting them in November.
+3. Ran on-call for the payments team for 6 weeks while Kenji was out. Two pages needed action, both resolved in under 30 minutes.
+4. Wrote the internal guide for schema migrations. Used by 4 teams so far. Asha said it saved her a week.
+
+Where I fell short
+
+- I said yes to too many small requests in Q2 and missed the date on the webhook retry spec by two weeks. Next time: say "I can do this Friday, the spec matters more" earlier.
+- Code review turnaround was slow in July (average 3 days). Better now, about 1 day since September.
+- I didn't push back on the scope of the reporting project and it cost another sprint.
+
+Goals for next cycle
+
+- Run design reviews without pulling in Marco first. He's been the default for two years.
+- Mentor one junior engineer formally. Priya suggested Dev, so maybe a monthly check-in.
+- Estimate within 20% on projects over 3 weeks. Q3 estimates were off by 40%.
+
+Feedback to ask for: Dwayne on cross-team communication; Ruth on whether the dashboard docs are clear.
+
+Before submitting: cut the paragraph about the hackathon, it reads like filler. Put the invoice job numbers in the first line. Check the title, it still says Senior Engineer I and I'm up for II.

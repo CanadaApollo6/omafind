@@ -1,0 +1,23 @@
+2023 tax year - paperwork checklist (file by April 15)
+
+received
+- W-2 from Arbor Lending (me), box 1 wages 118,400, federal withheld 19,870
+- W-2 from Lakeshore Clinic (Sofia, part time), box 1 31,200
+- 1099-INT from Bluebird Credit Union: 214.50 savings interest
+- 1099-B from Fidelity, 6 pages. We sold the index fund in June, need the cost basis from the PDF attachments
+- 1099-DIV from Vanguard, qualified dividends 880
+- childcare receipts from Little Acorns, 9,240 for the year (check the dependent care FSA)
+- donation receipts: animal shelter 250, food bank 120
+
+still missing
+- Sofia's 1099-NEC from the Harmon design contract (they said early February). Call them if it isn't here by Feb 20
+- the state form for the 529 contribution. Mom says she mailed it to the old address
+
+deductions
+- standard vs itemized: itemized would be about 14,800 (state tax paid 6,200, charity 370, no mortgage). Standard deduction for married filing jointly is 27,700, so standard wins
+- home office: see home-office-tax.md. Probably not worth it unless Sofia's freelance work qualifies
+
+to do
+- book Marjorie at the tax place on Fifth (she charged 340 last year)
+- scan everything into the 2023-taxes folder on the NAS
+- pull the January through December statements for the Schwab account

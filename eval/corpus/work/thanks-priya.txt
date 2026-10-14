@@ -1,0 +1,19 @@
+To: Priya Raman
+Subject: thank you
+
+Dear Priya,
+
+I've been meaning to write this for a while, so here it is. I'm sorry it took until October.
+
+When I joined the platform team two years ago I was terrified of the on-call rotation and sure I'd break production by Thursday. You sat with me for an hour that first week and walked through the runbook line by line. You also told me it was fine not to know the answer and to just ask. I had never worked anywhere that treated that as normal.
+
+The thing I keep coming back to is the review you gave me after the cache incident in March. You didn't soften it and you didn't pile on. You said what I did, what it cost, and what I'd do differently, and then you asked what I thought had gone wrong in the process rather than in me. That changed how I write post-incident reviews. I use the same framing with my own team now.
+
+Thank you also for the introduction to Ines. I didn't expect that conversation to go anywhere. It's the reason I'm leading the migration project.
+
+I'd like to take you to lunch this winter, on me. The Thai place on 5th you mentioned, or anywhere you like. Let me know what works. Maya says hi, she's sure you remember her from the summer picnic.
+
+With gratitude,
+Alex
+
+P.S. I finally used the git rebase cheat sheet you gave me. It saved me twice this month.

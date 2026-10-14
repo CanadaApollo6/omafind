@@ -1,0 +1,16 @@
+omafind
+Copyright 2026 The omafind authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+omafind runs, but does not contain, the following models. They are downloaded by
+`omafind models fetch` or installed by the omafind-models package, and remain under
+their own licenses:
+
+- EmbeddingGemma 2 by Google DeepMind (google/embeddinggemma-2), used through the ONNX
+  export onnx-community/embeddinggemma-2-ONNX. Apache License 2.0:
+  https://ai.google.dev/gemma/docs/gemma_4_license
+  Google asks that deployments follow the Gemma Prohibited Use Policy:
+  https://ai.google.dev/gemma/prohibited_use_policy
+- potion-base-8M and potion-code-16M-v2 by Minish Lab (minishlab/potion-base-8M,
+  minishlab/potion-code-16M-v2). MIT License.

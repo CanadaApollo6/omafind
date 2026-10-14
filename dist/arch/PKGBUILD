@@ -1,0 +1,106 @@
+# Maintainer: omafind authors <https://github.com/CanadaApollo6/omafind>
+# Builds from the main branch: `makepkg -si` in this directory.
+
+pkgbase=omafind-git
+pkgname=(omafind-git omafind-models)
+pkgver=r1
+pkgrel=1
+pkgdesc='Local semantic file search for Linux, powered by EmbeddingGemma 2'
+arch=(x86_64)
+url='https://github.com/CanadaApollo6/omafind'
+license=(Apache-2.0)
+makedepends=(cargo git libheif)
+
+# Models, pinned to a commit and checked against the same SHA-256 sums omafind verifies.
+_models=(
+  'potion-base-8M/config.json'
+  'potion-base-8M/model.safetensors'
+  'potion-base-8M/tokenizer.json'
+  'potion-code-16M-v2/config.json'
+  'potion-code-16M-v2/model.safetensors'
+  'potion-code-16M-v2/tokenizer.json'
+  'embeddinggemma-2/tokenizer.json'
+  'embeddinggemma-2/config.json'
+  'embeddinggemma-2/onnx/model_q4.onnx'
+  'embeddinggemma-2/onnx/model_q4.onnx_data'
+  'embeddinggemma-2/onnx/vision_encoder_q4.onnx'
+  'embeddinggemma-2/onnx/vision_encoder_q4.onnx_data'
+)
+source=(
+  'omafind::git+https://github.com/CanadaApollo6/omafind.git'
+  'potion-base-8M__config.json::https://huggingface.co/minishlab/potion-base-8M/resolve/bf8b056651a2c21b8d2565580b8569da283cab23/config.json'
+  'potion-base-8M__model.safetensors::https://huggingface.co/minishlab/potion-base-8M/resolve/bf8b056651a2c21b8d2565580b8569da283cab23/model.safetensors'
+  'potion-base-8M__tokenizer.json::https://huggingface.co/minishlab/potion-base-8M/resolve/bf8b056651a2c21b8d2565580b8569da283cab23/tokenizer.json'
+  'potion-code-16M-v2__config.json::https://huggingface.co/minishlab/potion-code-16M-v2/resolve/e9d2a44ca6a05ac6685f3b23709ea57eb7352d5b/config.json'
+  'potion-code-16M-v2__model.safetensors::https://huggingface.co/minishlab/potion-code-16M-v2/resolve/e9d2a44ca6a05ac6685f3b23709ea57eb7352d5b/model.safetensors'
+  'potion-code-16M-v2__tokenizer.json::https://huggingface.co/minishlab/potion-code-16M-v2/resolve/e9d2a44ca6a05ac6685f3b23709ea57eb7352d5b/tokenizer.json'
+  'embeddinggemma-2__tokenizer.json::https://huggingface.co/onnx-community/embeddinggemma-2-ONNX/resolve/daa72c51243991dfcaf9f9137d2c573d8f7790c0/tokenizer.json'
+  'embeddinggemma-2__config.json::https://huggingface.co/onnx-community/embeddinggemma-2-ONNX/resolve/daa72c51243991dfcaf9f9137d2c573d8f7790c0/config.json'
+  'embeddinggemma-2__onnx__model_q4.onnx::https://huggingface.co/onnx-community/embeddinggemma-2-ONNX/resolve/daa72c51243991dfcaf9f9137d2c573d8f7790c0/onnx/model_q4.onnx'
+  'embeddinggemma-2__onnx__model_q4.onnx_data::https://huggingface.co/onnx-community/embeddinggemma-2-ONNX/resolve/daa72c51243991dfcaf9f9137d2c573d8f7790c0/onnx/model_q4.onnx_data'
+  'embeddinggemma-2__onnx__vision_encoder_q4.onnx::https://huggingface.co/onnx-community/embeddinggemma-2-ONNX/resolve/daa72c51243991dfcaf9f9137d2c573d8f7790c0/onnx/vision_encoder_q4.onnx'
+  'embeddinggemma-2__onnx__vision_encoder_q4.onnx_data::https://huggingface.co/onnx-community/embeddinggemma-2-ONNX/resolve/daa72c51243991dfcaf9f9137d2c573d8f7790c0/onnx/vision_encoder_q4.onnx_data'
+)
+sha256sums=(
+  'SKIP'
+  '2a6ac0e9aaa356a68a5688070db78fc3a464fefe85d2f06a1905ce3718687553'
+  'f65d0f325faadc1e121c319e2faa41170d3fa07d8c89abd48ca5358d9a223de2'
+  'e67e803f624fb4d67dea1c730d06e1067e1b14d830e2c2202569e3ef0f70bb50'
+  '148e5691a6fcc553437156859701fba017a1ba5d340b170f17e0f3668fb861a7'
+  '75cf7a6c2171b230ad19b1e7d8e0b1aee86da5a02af8e7cacedd9921d227623c'
+  '107bbdcbad4bff1d299b7a4c3a2fb17c52890688b7dd0e4c9deab79d3c4f3d45'
+  '4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4'
+  '8d011bfe08b5e345bbe0b81e5c6fd02c381920b345b986047bc2a33ce7b90d1d'
+  'f9eeba97acddf139b8ee2ddf04bc30dceafa88de93fadf74d7644e0d61a477a9'
+  'c3975f2d1ab7a1878ae31a7d7a9b7804a827aff3800b60dfceafce21cac3df49'
+  '7ea284226d4938f0ad921ab091f1d80a9ca699aa802984ef5cd5eec4f4761d96'
+  '0a9d6c927334f152a33dd90874f65d6ea5228999abe6a450d3f7813677fa704c'
+)
+
+pkgver() {
+  cd omafind
+  printf 'r%s.%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+  cd omafind
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc --print host-tuple)"
+}
+
+build() {
+  cd omafind
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  # Not --frozen: the ort crate downloads its ONNX Runtime build here.
+  cargo build --release --locked
+}
+
+check() {
+  cd omafind
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  cargo test --release --locked
+}
+
+package_omafind-git() {
+  depends=(gcc-libs glibc libheif poppler)
+  optdepends=('omafind-models: models preinstalled (otherwise run `omafind models fetch`)')
+  provides=(omafind)
+  conflicts=(omafind)
+  cd omafind
+  install -Dm755 target/release/omafind -t "$pkgdir/usr/bin"
+  install -Dm644 dist/systemd/omafind.service -t "$pkgdir/usr/lib/systemd/user"
+  install -Dm644 dist/omarchy/omafind.search/* -t "$pkgdir/usr/share/omafind/omarchy/omafind.search"
+  install -Dm644 README.md -t "$pkgdir/usr/share/doc/omafind"
+  install -Dm644 LICENSE NOTICE -t "$pkgdir/usr/share/licenses/$pkgname"
+}
+
+package_omafind-models() {
+  pkgdesc='Models for omafind: EmbeddingGemma 2 (q4 ONNX, text and vision) and Model2Vec static models'
+  arch=(any)
+  license=(Apache-2.0 MIT)
+  local m
+  for m in "${_models[@]}"; do
+    install -Dm644 "$srcdir/${m//\//__}" "$pkgdir/usr/share/omafind/models/$m"
+  done
+  install -Dm644 omafind/NOTICE -t "$pkgdir/usr/share/licenses/$pkgname"
+}

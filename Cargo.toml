@@ -1,0 +1,57 @@
+[package]
+name = "omafind"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "Local semantic file search for Linux, powered by EmbeddingGemma 2 and static embeddings"
+license = "Apache-2.0"
+repository = "https://github.com/CanadaApollo6/omafind"
+readme = "README.md"
+keywords = ["search", "semantic-search", "embeddings", "gemma", "linux"]
+categories = ["command-line-utilities", "filesystem"]
+
+[features]
+default = ["heif"]
+# Decode HEIC/HEIF photos through the system libheif.
+heif = ["dep:libheif-rs"]
+# Run EmbeddingGemma on an NVIDIA GPU through ONNX Runtime's CUDA execution provider.
+cuda = ["ort/cuda"]
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+calamine = "0.36"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
+crossbeam-channel = "0.5"
+directories = "6"
+globset = "0.4"
+ignore = "0.4"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "tiff", "bmp", "ico", "rayon"] }
+kamadak-exif = "0.6"
+libc = "0.2"
+libheif-rs = { version = "3", optional = true }
+model2vec-rs = { version = "0.3", default-features = false, features = ["onig"] }
+notify = "8"
+ort = { version = "2.0.0-rc.14" }
+quick-xml = "0.42"
+rayon = "1"
+rusqlite = { version = "0.40", features = ["bundled"] }
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlite-vec = "=0.1.9"
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+toml = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ureq = "3"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true

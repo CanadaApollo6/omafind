@@ -1,0 +1,22 @@
+Bio 101, lecture 6 - photosynthesis (Dr. Lindqvist, Tuesday)
+
+Big picture: plants, algae and some bacteria capture light energy and store it as chemical energy in glucose. Oxygen is a byproduct. It comes from splitting water, not from CO2, which surprised a lot of people in the room.
+
+Two stages:
+1. Light-dependent reactions, in the thylakoid membranes. Chlorophyll absorbs mostly red and blue light; green gets reflected, which is why leaves look green. Water is split, O2 is released, and ATP and NADPH are made.
+2. Light-independent reactions (the Calvin cycle), in the stroma. CO2 is fixed by the enzyme RuBisCO into a 3-carbon compound, then reduced to G3P, which builds glucose. Dr. L says RuBisCO is probably the most abundant protein on Earth, and also slow and kind of inefficient.
+
+Numbers:
+- rough equation: 6CO2 + 6H2O + light -> C6H12O6 + 6O2
+- real crops convert about 1-2% of incoming sunlight. Dr. L joked that solar panels are way better and we should be ashamed.
+
+C3, C4 and CAM:
+- C3 (wheat, rice, most trees): RuBisCO grabs O2 instead of CO2 when it's hot and dry (photorespiration)
+- C4 (corn, sugarcane): fixes CO2 first in mesophyll cells, then concentrates it for the Calvin cycle in bundle sheath cells
+- CAM (cacti, pineapple): separates the steps in time, opens stomata at night
+
+Exam will likely ask to compare C3 and C4 in hot climates. Know why C4 evolved more than once.
+
+Lab next week: leaf disc assay with bicarbonate solution and a syringe to make the discs float. Bring a calculator.
+
+Still unclear: how exactly the proton gradient across the thylakoid drives ATP synthase. Re-read chapter 8 before Thursday.

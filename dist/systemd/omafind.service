@@ -1,0 +1,17 @@
+[Unit]
+Description=omafind file indexer and search daemon
+Documentation=https://github.com/CanadaApollo6/omafind
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/omafind daemon
+Restart=on-failure
+RestartSec=10
+# Indexing yields to everything else; the daemon also lowers its own indexer thread and
+# throttles itself on battery or when the machine is busy.
+CPUWeight=20
+IOWeight=20
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

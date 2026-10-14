@@ -1,0 +1,277 @@
+# Evaluation queries for omafind. Paths are relative to eval/corpus/.
+[[query]]
+q = "okafor water heater"
+expect = ["notes/2024-03-11.md"]
+type = "keyword"
+
+[[query]]
+q = "biscuit rescue dog"
+expect = ["journal/entry-17.txt"]
+type = "keyword"
+
+[[query]]
+q = "pgbouncer postgres migration"
+expect = ["work/mtg-notes-q3.md"]
+type = "keyword"
+
+[[query]]
+q = "priya raman"
+expect = ["work/thanks-priya.txt"]
+type = "keyword"
+
+[[query]]
+q = "brightline offer"
+expect = ["work/offers.md"]
+type = "keyword"
+
+[[query]]
+q = "harbor mutual claim"
+expect = ["notes/2024-06-19.md"]
+type = "keyword"
+
+[[query]]
+q = "mateo toast"
+expect = ["notes/toast-v2.txt"]
+type = "keyword"
+
+[[query]]
+q = "alfama castle"
+expect = ["travel/trip2.md"]
+type = "keyword"
+
+[[query]]
+q = "shinjuku packing"
+expect = ["travel/japan.txt"]
+type = "keyword"
+
+[[query]]
+q = "meridian air"
+expect = ["travel/letter.txt"]
+type = "keyword"
+
+[[query]]
+q = "owner stalling while we go cold showers all week"
+expect = ["notes/2024-03-11.md"]
+type = "semantic"
+
+[[query]]
+q = "the tooth doctor visit where the hygienist measured my gums"
+expect = ["health/checkup.md"]
+type = "semantic"
+
+[[query]]
+q = "feeding schedule for my wild yeast jar"
+expect = ["recipes/bread-log.md"]
+type = "semantic"
+
+[[query]]
+q = "layered pasta bake with ricotta my family makes on weekends"
+expect = ["recipes/sunday.md"]
+type = "semantic"
+
+[[query]]
+q = "weeknight citrus garlic thighs on one tray"
+expect = ["recipes/2-chicken.md"]
+type = "semantic"
+
+[[query]]
+q = "creamy spiced dinner with coconut milk over rice"
+expect = ["recipes/chx.txt"]
+type = "semantic"
+
+[[query]]
+q = "two days up the river tasting fortified wine"
+expect = ["travel/trip-b.txt"]
+type = "semantic"
+
+[[query]]
+q = "four days in hilly seaside capital, trams and tarts"
+expect = ["travel/trip2.md"]
+type = "semantic"
+
+[[query]]
+q = "what to pack for the big eastern city trip"
+expect = ["travel/japan.txt"]
+type = "semantic"
+
+[[query]]
+q = "angry note to airline after suitcase missed connection"
+expect = ["travel/letter.txt"]
+type = "semantic"
+
+[[query]]
+q = "how household money flowed in and out this summer"
+expect = ["finance/budget.txt"]
+type = "semantic"
+
+[[query]]
+q = "can I deduct my spare room work corner"
+expect = ["finance/home-office-tax.md"]
+type = "semantic"
+
+[[query]]
+q = "sixteen week plan building to a 13.1 mile race"
+expect = ["health/plan.txt"]
+type = "semantic"
+
+[[query]]
+q = "the fasting bloodwork from my yearly physical, cholesterol and thyroid"
+expect = ["health/labs.txt"]
+type = "semantic"
+
+[[query]]
+q = "experiment comparing seedling height under red and blue bulbs"
+expect = ["school/p2.md"]
+type = "semantic"
+
+[[query]]
+q = "outline on why the monarchy in paris fell in 1789"
+expect = ["school/history-3.txt"]
+type = "semantic"
+
+[[query]]
+q = "class recap on how green cells make sugar"
+expect = ["school/bio-notes.txt"]
+type = "semantic"
+
+[[query]]
+q = "secret fortieth bash for my friend, invite list"
+expect = ["journal/entry-18.txt"]
+type = "semantic"
+
+[[query]]
+q = "self review draft listing wins and growth goals"
+expect = ["work/draft2.txt"]
+type = "semantic"
+
+[[query]]
+q = "meeting where we chose a new open source database engine"
+expect = ["work/mtg-notes-q3.md"]
+type = "semantic"
+
+[[query]]
+q = "pros and cons of two employers that recruited me"
+expect = ["work/offers.md"]
+type = "semantic"
+
+[[query]]
+q = "thank you email to the person who coached me"
+expect = ["work/thanks-priya.txt"]
+type = "semantic"
+
+[[query]]
+q = "self help book about tiny daily actions adding up"
+expect = ["notes/2023-11-30.md"]
+type = "semantic"
+
+[[query]]
+q = "ideas for presents for family and coworkers this december"
+expect = ["notes/todo-old.txt"]
+type = "semantic"
+
+[[query]]
+q = "rear-end crash in grocery parking lot, adjuster's call"
+expect = ["notes/2024-06-19.md"]
+type = "semantic"
+
+[[query]]
+q = "mtg notes q3"
+expect = ["work/mtg-notes-q3.md"]
+type = "filename"
+
+[[query]]
+q = "bread log"
+expect = ["recipes/bread-log.md"]
+type = "filename"
+
+[[query]]
+q = "electric csv"
+expect = ["finance/electric.csv"]
+type = "filename"
+
+[[query]]
+q = "reading csv"
+expect = ["school/reading.csv"]
+type = "filename"
+
+[[query]]
+q = "journal 2024-01-01"
+expect = ["journal/2024-01-01.txt"]
+type = "filename"
+
+[[query]]
+q = "function that waits longer after each failed request"
+expect = ["code/scratch/util.py"]
+type = "code"
+
+[[query]]
+q = "shell script that mirrors my pictures folder to the nas"
+expect = ["code/backup/photos.sh"]
+type = "code"
+
+[[query]]
+q = "rust program that sums a csv column"
+expect = ["code/tools/csvsum/src/main.rs"]
+type = "code"
+
+[[query]]
+q = "go server that answers health checks with json"
+expect = ["code/tools/health-srv/main.go"]
+type = "code"
+
+[[query]]
+q = "javascript helper that delays a function until typing stops"
+expect = ["code/web/debounce.js"]
+type = "code"
+
+[[query]]
+q = "react hook that fetches json and tracks loading"
+expect = ["code/web/useFetch.ts"]
+type = "code"
+
+[[query]]
+q = "python script that shrinks pictures to a max width"
+expect = ["code/imgtool/resize.py"]
+type = "code"
+
+[[query]]
+q = "github actions workflow that runs tests on every push"
+expect = ["code/ci/build.yml"]
+type = "code"
+
+[[query]]
+q = "toml file with app port and log level settings"
+expect = ["code/app/config.toml"]
+type = "code"
+
+[[query]]
+q = "python function that pages through an api and collects everything"
+expect = ["code/scratch/fetch.py"]
+type = "code"
+
+# Negative queries: nothing in the corpus is about these, so the best answer is no results.
+# They measure how much noise each mode shows ("shown"), not recall.
+[[query]]
+q = "volcano eruption footage"
+expect = []
+type = "negative"
+
+[[query]]
+q = "knitting pattern for a cable scarf"
+expect = []
+type = "negative"
+
+[[query]]
+q = "kubernetes ingress controller setup"
+expect = []
+type = "negative"
+
+[[query]]
+q = "aquarium filter maintenance"
+expect = []
+type = "negative"
+
+[[query]]
+q = "skateboard deck graphics"
+expect = []
+type = "negative"

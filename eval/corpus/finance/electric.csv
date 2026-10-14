@@ -1,0 +1,13 @@
+month,kwh,cost_usd,avg_temp_f,notes
+2023-10,612,71.20,63,heat pump kicked on late in the month, checked against the utility bill
+2023-11,655,78.90,52,first real cold week and the space heater in the office, checked against the utility bill
+2023-12,740,91.35,41,holiday lights on the porch all month and the oven baking, checked against the utility bill
+2024-01,801,98.10,35,coldest month and the heat pump defrost cycles were loud, checked against the utility bill
+2024-02,690,84.25,38,shorter month but the dryer ran a lot, checked against the utility bill
+2024-03,548,66.40,47,windows open two weekends, checked against the utility bill
+2024-04,492,59.85,56,mostly quiet and the tomato seedlings under the grow light, checked against the utility bill
+2024-05,470,57.10,64,garden pump and the new fridge, checked against the utility bill
+2024-06,611,74.60,76,AC started on the 9th, checked against the utility bill
+2024-07,905,112.30,84,AC ran most afternoons with two heat waves, checked against the utility bill
+2024-08,942,118.75,86,highest month, the fans ran all weekend for the sleepover, checked against the utility bill
+2024-09,684,83.20,74,AC off by mid month, the dishwasher upgrade helped a bit, checked against the utility bill
