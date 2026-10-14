@@ -41,6 +41,9 @@ enum Cmd {
         /// Only the Gemma tier.
         #[arg(long)]
         deep: bool,
+        /// Match file names only (word starts, then anywhere in the name). Filters still apply.
+        #[arg(long, conflicts_with_all = ["fast", "deep"])]
+        names: bool,
         /// Results per group.
         #[arg(short = 'n', long)]
         limit: Option<usize>,
@@ -141,9 +144,14 @@ fn run(cli: Cli) -> Result<()> {
     }
     let cfg = Config::load(cli.config.as_deref())?;
     match cli.cmd {
-        Cmd::Search { query, json, fast, deep, limit, pause, no_daemon } => {
-            let opts =
-                StreamOpts { limit: limit.unwrap_or(cfg.search.limit), fast: !deep, deep: !fast, pause_ms: pause };
+        Cmd::Search { query, json, fast, deep, names, limit, pause, no_daemon } => {
+            let opts = StreamOpts {
+                limit: limit.unwrap_or(cfg.search.limit),
+                names_only: names,
+                fast: !deep,
+                deep: !fast,
+                pause_ms: pause,
+            };
             search(&cfg, &query.join(" "), opts, json, no_daemon)
         }
         Cmd::Index { no_images } => index(&cfg, no_images),
@@ -210,9 +218,10 @@ fn search(cfg: &Config, input: &str, opts: StreamOpts, json: bool, no_daemon: bo
     };
 
     if !no_daemon && let Some(conn) = ipc::connect() {
-        let stages = match (opts.fast, opts.deep) {
-            (true, false) => "fast",
-            (false, true) => "deep",
+        let stages = match (opts.names_only, opts.fast, opts.deep) {
+            (true, _, _) => "names",
+            (_, true, false) => "fast",
+            (_, false, true) => "deep",
             _ => "both",
         };
         let req =

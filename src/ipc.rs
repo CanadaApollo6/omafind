@@ -20,7 +20,7 @@ pub enum Request {
         q: String,
         #[serde(default = "default_limit")]
         limit: usize,
-        /// "both" (default), "fast" or "deep".
+        /// "both" (default), "fast", "deep" or "names" (file names only).
         #[serde(default = "default_stages")]
         stages: String,
         #[serde(default = "default_pause")]

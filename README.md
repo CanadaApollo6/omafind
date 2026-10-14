@@ -68,6 +68,7 @@ omafind status                               # index and daemon state
 omafind search lease renewal email           # grouped results: documents, code, images
 omafind search kind:image dog on the beach
 omafind search "tax return" after:2024-01 ext:pdf
+omafind search --names invoice 2023          # file names only
 omafind search --json budget spreadsheet     # one JSON line per stage, for scripts
 omafind index                                # index now, in the foreground
 ```
@@ -81,10 +82,21 @@ Filters can be mixed with words:
 | `after:2024-03`, `since:2w`, `before:2023`, `until:3d`, `year:2022` | modified (photos: taken) date |
 | `in:~/Documents`, `path:work` | folder |
 
+**File names only.** When you know roughly what a file is called, `--names` (or **Tab** in
+the launcher) skips contents and Gemma:
+- Every word must start a word in the name: "tax 23" finds `Tax-Return-2023.pdf`.
+- Typed text also matches anywhere in the name: "4021" finds `IMG_4021.HEIC`.
+- Only if nothing matches that way, any single word will do.
+- Filters still apply.
+
+To open the launcher straight into name mode, bind
+`omarchy-shell shell toggle omafind.search '{"names":true}'`.
+
 In the launcher:
 - **Enter** opens the result.
 - **Alt+Enter** or **Ctrl+Enter** shows it in the file manager.
 - **Shift+Enter** copies its path.
+- **Tab** switches between content search and file names only.
 
 ## What gets indexed
 
@@ -163,7 +175,7 @@ the corpus. Reproduce with `omafind eval --corpus eval/corpus --queries eval/que
 
 | mode | Hit@1 | Hit@5 | Hit@10 | MRR | results shown | mean ms |
 |---|---|---|---|---|---|---|
-| file name only | 0.26 | 0.26 | 0.26 | 0.260 | 0.7 | 0.2 |
+| file name only | 0.26 | 0.26 | 0.26 | 0.260 | 0.6 | 0.1 |
 | keywords (BM25) | 0.78 | 0.92 | 0.98 | 0.848 | 8.8 | 0.3 |
 | instant tier | 0.86 | 0.98 | 0.98 | 0.903 | 8.9 | 0.7 |
 | deep tier (Gemma) | **0.92** | **1.00** | **1.00** | **0.953** | **2.7** | 30.0 |

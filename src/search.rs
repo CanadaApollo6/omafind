@@ -31,6 +31,10 @@ const RRF_K: f64 = 60.0;
 const KEYWORD_K: usize = 100;
 const STATIC_K: usize = 100;
 const NAME_K: usize = 60;
+/// Files a name-only search returns across all kinds (before grouping).
+const NAMES_ONLY_K: usize = 200;
+/// Shortest text matched anywhere inside names (shorter only matches word starts).
+const NAME_SUBSTRING_MIN: usize = 3;
 /// Chunks the keyword stage may rank per query (~0.5 µs each).
 const KEYWORD_BUDGET: i64 = 20_000;
 const TERM_COUNT_MAX_AGE_SECS: u64 = 600;
@@ -318,10 +322,10 @@ impl Rng {
     }
 }
 
-/// Which signals the fast stage may use (the evaluation compares them).
+/// Which signals the fast stage may use (the evaluation compares them). File-name search
+/// on its own is `Engine::names`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FastMode {
-    NamesOnly,
     Keyword,
     Full,
 }
@@ -431,9 +435,7 @@ impl Engine {
                 sig(&mut e.2, sim >= STATIC_MIN_SIM && sim - mean >= STATIC_MIN_LIFT);
             }
         };
-        if mode != FastMode::NamesOnly
-            && let Some(m) = self.keyword_query(conn, &terms)?
-        {
+        if let Some(m) = self.keyword_query(conn, &terms)? {
             let kw: Vec<(i64, i64, f64)> = keyword_match(conn, &m)?.into_iter().map(|(c, f)| (c, f, 0.0)).collect();
             add(&kw, 1.0, |s, _| s.keyword = true);
         }
@@ -549,6 +551,32 @@ impl Engine {
             tracing::trace!("{space:?}: top {} mean {mean:.3}", top.join(" "));
         }
         Ok(rows)
+    }
+
+    /// File-name search only, for when you know roughly what a file is called. Never runs
+    /// Gemma; filters apply before the limit.
+    pub fn names(&self, conn: &Connection, q: &Query) -> Result<Outcome> {
+        let started = Instant::now();
+        if q.text.trim().is_empty() {
+            return self.browse(conn, q, started);
+        }
+        let ids = names_only(conn, q, NAMES_ONLY_K)?;
+        let n = ids.len() as f64;
+        let ranked: Vec<_> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, &f)| (f, n - i as f64, None, Signals { name: true, ..Default::default() }))
+            .collect();
+        let hits = self.load_hits(conn, q, &[], &ranked)?;
+        Ok(Outcome {
+            stage: Stage::Fast,
+            hits,
+            elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+            note: None,
+            candidates: Vec::new(),
+            name_ranked: ids.clone(),
+            fast_ranked: ids,
+        })
     }
 
     fn browse(&self, conn: &Connection, q: &Query, started: Instant) -> Result<Outcome> {
@@ -846,6 +874,8 @@ impl Engine {
 #[derive(Debug, Clone, Copy)]
 pub struct StreamOpts {
     pub limit: usize,
+    /// File names only: one stage, no keywords, vectors or Gemma.
+    pub names_only: bool,
     pub fast: bool,
     pub deep: bool,
     /// After the fast results, wait this long for the user to keep typing before running Gemma.
@@ -866,6 +896,9 @@ impl Engine {
         emit: &mut dyn FnMut(&Results) -> Result<()>,
     ) -> Result<()> {
         let q = parse_query(input);
+        if opts.names_only {
+            return emit(&self.names(conn, &q)?.results(input, opts.limit));
+        }
         let fast = self.fast(conn, &q, FastMode::Full)?;
         if opts.fast {
             emit(&fast.results(input, opts.limit))?;
@@ -914,6 +947,55 @@ fn image_threshold(sims: &[f64]) -> f64 {
     sorted.sort_by(|a, b| a.total_cmp(b));
     let median = sorted[sorted.len() / 2];
     (top - 0.06).max(median + 0.01).min(top)
+}
+
+/// Files whose name has every query word as a word prefix ("tax 23" finds
+/// `Tax-Return-2023.pdf`), best first; then names containing the typed text anywhere
+/// ("4021" finds `IMG_4021.HEIC`). Only if neither matches, names with any of the words.
+fn names_only(conn: &Connection, q: &Query, limit: usize) -> Result<Vec<i64>> {
+    use rusqlite::types::Value;
+    let (where_sql, filter_args) = filter_sql(q);
+    let mut ids: Vec<i64> = Vec::new();
+    let extend = |ids: &mut Vec<i64>, more: Vec<i64>| {
+        for id in more {
+            if ids.len() >= limit {
+                break;
+            }
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    };
+    let fts = |m: String| -> Result<Vec<i64>> {
+        let sql = format!(
+            "SELECT id FROM (SELECT rowid AS id, rank AS r FROM names_fts WHERE names_fts MATCH ?) JOIN files USING(id)
+             WHERE 1=1 {where_sql} ORDER BY r, length(name) LIMIT {limit}"
+        );
+        let mut args = vec![Value::Text(format!("{{name}} : ({m})"))];
+        args.extend(filter_args.iter().cloned());
+        Ok(conn.prepare(&sql)?.query_map(params_from_iter(args), |r| r.get(0))?.collect::<Result<_, _>>()?)
+    };
+    let toks = tokens(&q.text);
+    if !toks.is_empty() {
+        extend(&mut ids, fts(toks.iter().map(|t| format!("{}*", fts_quote(t))).collect::<Vec<_>>().join(" AND "))?);
+    }
+    let needle = q.text.trim();
+    if ids.len() < limit && needle.chars().count() >= NAME_SUBSTRING_MIN {
+        let sql = format!(
+            "SELECT id FROM files WHERE name LIKE ? ESCAPE '\\' {where_sql} ORDER BY length(name), name LIMIT {limit}"
+        );
+        let escaped = needle.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let mut args = vec![Value::Text(format!("%{escaped}%"))];
+        args.extend(filter_args.iter().cloned());
+        let more: Vec<i64> =
+            conn.prepare(&sql)?.query_map(params_from_iter(args), |r| r.get(0))?.collect::<Result<_, _>>()?;
+        extend(&mut ids, more);
+    }
+    let terms: Vec<&String> = toks.iter().filter(|t| !STOPWORDS.contains(&t.as_str())).collect();
+    if ids.is_empty() && terms.len() > 1 {
+        extend(&mut ids, fts(terms.iter().map(|t| format!("{}*", fts_quote(t))).collect::<Vec<_>>().join(" OR "))?);
+    }
+    Ok(ids)
 }
 
 fn names_match(conn: &Connection, m: &str) -> Result<Vec<i64>> {
@@ -1004,6 +1086,48 @@ pub fn display_dir(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_only_matches_word_starts_then_substrings() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("t.sqlite")).unwrap();
+        for (i, (path, kind)) in [
+            ("/h/Pictures/IMG_4021.HEIC", "image"),
+            ("/h/Documents/Tax-Return-2023.pdf", "document"),
+            ("/h/notes/taxonomy.txt", "document"),
+            ("/h/notes/groceries.md", "document"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let name = path.rsplit('/').next().unwrap();
+            let ext = name.rsplit('.').next().unwrap().to_lowercase();
+            conn.execute(
+                "INSERT INTO files(id, path, name, ext, kind, size, mtime, indexed_at) VALUES (?1, ?2, ?3, ?4, ?5, 1, 1, 1)",
+                rusqlite::params![i as i64 + 1, path, name, ext, kind],
+            )
+            .unwrap();
+        }
+        let find = |input: &str| {
+            let ids = names_only(&conn, &parse_query(input), 10).unwrap();
+            let mut names: Vec<String> = ids
+                .iter()
+                .map(|id| conn.query_row("SELECT name FROM files WHERE id=?1", [id], |r| r.get(0)).unwrap())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(find("tax 2023"), ["Tax-Return-2023.pdf"]);
+        // No name has both words: either word will do.
+        assert_eq!(find("groceries 2023"), ["Tax-Return-2023.pdf", "groceries.md"]);
+        assert_eq!(find("tax"), ["Tax-Return-2023.pdf", "taxonomy.txt"]);
+        assert_eq!(find("021"), ["IMG_4021.HEIC"]);
+        assert_eq!(find("g_40"), ["IMG_4021.HEIC"]);
+        assert!(find("%021").is_empty(), "% is literal, not a wildcard");
+        assert_eq!(find("tax kind:document ext:txt"), ["taxonomy.txt"]);
+        assert_eq!(find("onomy"), ["taxonomy.txt"]);
+        assert!(find("qu").is_empty());
+    }
 
     #[test]
     fn parses_filters() {

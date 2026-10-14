@@ -23,6 +23,8 @@ Item {
   property string note: ""
   property string errorText: ""
   property bool searching: false
+  // Tab toggles: match file names only (no contents, no Gemma).
+  property bool namesOnly: false
   property int resultsPerGroup: 6
   property int pauseMs: 300
 
@@ -53,6 +55,7 @@ Item {
     var payload = {}
     try { payload = JSON.parse(payloadJson || "{}") } catch (e) {}
     root.opened = true
+    root.namesOnly = payload.names === true
     root.setFilter(payload.query ? String(payload.query) : "")
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
@@ -74,7 +77,7 @@ Item {
       var r = displayModel.get(i)
       rows.push(r.rowType === "header" ? "# " + r.title : r.name)
     }
-    return JSON.stringify({ query: root.filterText, stage: root.stage, searching: root.searching,
+    return JSON.stringify({ query: root.filterText, names: root.namesOnly, stage: root.stage, searching: root.searching,
                             error: root.errorText, note: root.note, rows: rows })
   }
 
@@ -102,9 +105,15 @@ Item {
     root.searching = true
     searchProc.running = false
     searchProc.command = ["sh", "-c",
-      "PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:$PATH\" exec \"$0\" search --json --pause \"$1\" -n \"$2\" -- \"$3\"",
-      root.omafindCommand, String(root.pauseMs), String(root.resultsPerGroup), q]
+      "PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:$PATH\" exec \"$0\" search --json ${4:+--names} --pause \"$1\" -n \"$2\" -- \"$3\"",
+      root.omafindCommand, String(root.pauseMs), String(root.resultsPerGroup), q, root.namesOnly ? "1" : ""]
     searchProc.running = true
+  }
+
+  function toggleNamesOnly() {
+    root.namesOnly = !root.namesOnly
+    root.userMoved = false
+    if (root.filterText.trim().length > 0) root.startSearch()
   }
 
   function handleLine(line) {
@@ -309,6 +318,9 @@ Item {
             if (root.filterText) root.setFilter("")
             else root.close()
             event.accepted = true
+          } else if (event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) {
+            root.toggleNamesOnly()
+            event.accepted = true
           } else if (Util.editsFilter(event, root.filterText)) {
             root.setFilter(Util.editedFilter(event, root.filterText))
             event.accepted = true
@@ -360,7 +372,9 @@ Item {
             anchors.right: stageText.left
             anchors.rightMargin: Style.space(12)
             anchors.verticalCenter: parent.verticalCenter
-            text: root.filterText || "Find files by what's in them…   kind:image  ext:pdf  after:2024-03  in:~/Documents"
+            text: root.filterText || (root.namesOnly
+                  ? "Find files by name…   kind:image  ext:pdf  after:2024-03  in:~/Documents"
+                  : "Find files by what's in them…   kind:image  ext:pdf  after:2024-03  in:~/Documents")
             color: root.foreground
             opacity: root.filterText ? 1 : 0.58
             font.family: root.fontFamily
@@ -373,8 +387,11 @@ Item {
             textFormat: Text.PlainText
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
-            visible: root.filterText.length > 0
-            text: root.searching && root.stage !== "deep" ? (root.stage === "fast" ? "thinking…" : "searching…")
+            visible: root.filterText.length > 0 || root.namesOnly
+            text: root.namesOnly
+                  ? (root.searching ? "names · searching…"
+                     : root.filterText && root.stage ? "names · " + Math.round(root.elapsedMs) + " ms" : "names only")
+                  : root.searching && root.stage !== "deep" ? (root.stage === "fast" ? "thinking…" : "searching…")
                   : (root.stage === "deep" ? "Gemma · " + Math.round(root.elapsedMs) + " ms" : "")
             color: root.foreground
             opacity: 0.5
@@ -637,8 +654,10 @@ Item {
             Text {
               textFormat: Text.PlainText
               text: root.errorText ? root.errorText
+                    : !root.filterText && root.namesOnly ? "Type part of a file name: \"invoice\", \"IMG_4021\", \"tax 2023\""
                     : !root.filterText ? "Describe what's in the file: \"tax letter from 2023\", \"photos of the beach at sunset\""
                     : root.searching ? "Searching…"
+                    : root.namesOnly ? "No file names match “" + root.filterText + "” (tab searches contents)"
                     : "Nothing found for “" + root.filterText + "”"
               color: root.foreground
               opacity: 0.7
@@ -660,7 +679,8 @@ Item {
             anchors.left: parent.left
             anchors.right: noteText.left
             anchors.verticalCenter: parent.verticalCenter
-            text: "↵ open    alt+↵ show in folder    shift+↵ copy path    esc close"
+            text: "↵ open    alt+↵ show in folder    shift+↵ copy path    "
+                  + (root.namesOnly ? "tab search contents" : "tab names only") + "    esc close"
             color: root.foreground
             opacity: 0.45
             font.family: root.fontFamily

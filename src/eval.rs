@@ -131,7 +131,7 @@ pub fn run(cfg: &Config, corpus: &Path, queries: &Path, modes: &[String], cold: 
         let mut full: Option<Outcome> = None;
         for mode in modes {
             let (outcome, elapsed) = match mode.as_str() {
-                "filename" => timed(|| engine.fast(&conn, &q, FastMode::NamesOnly))?,
+                "filename" => timed(|| engine.names(&conn, &q))?,
                 "keyword" => timed(|| engine.fast(&conn, &q, FastMode::Keyword))?,
                 "fast" => timed(|| engine.fast(&conn, &q, FastMode::Full))?,
                 "deep" => {

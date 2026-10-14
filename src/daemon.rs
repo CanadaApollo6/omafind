@@ -137,6 +137,7 @@ fn handle(conn: UnixStream, s: &Shared) -> Result<()> {
             let db = s.engine.open()?;
             let opts = StreamOpts {
                 limit: limit.clamp(1, 200),
+                names_only: stages == "names",
                 fast: stages != "deep",
                 deep: stages != "fast",
                 pause_ms: pause_ms.min(5000),
