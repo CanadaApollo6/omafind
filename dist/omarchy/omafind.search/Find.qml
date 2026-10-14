@@ -37,16 +37,25 @@ Item {
   property color scrim: Commons.Color.menu.scrim
   property color selectedBackground: Commons.Color.menu.selectedBackground
   property color selectedText: Commons.Color.menu.selectedText
+  property color selectedBorder: Commons.Color.menu.selectedBorder
+  property var selectedBorderSpec: Border.surfaceSpec("menu", "selected-border", selectedBorder, 0)
+  readonly property real rowReservedBorderLeft: Border.left(selectedBorderSpec)
+  readonly property real rowReservedBorderRight: Border.right(selectedBorderSpec)
+  // Errors use the theme's urgent color, as other shell panels do.
+  property color urgent: Commons.Color.urgent
+  // One dim level for all secondary text (paths, snippets, metadata, hints), as in Menu.
+  readonly property real dimOpacity: 0.52
   readonly property int cornerRadius: Style.cornerRadius
   property string fontFamily: Style.font.menuFamily
   property int contentMargin: Style.spacing.panelPadding
   property int headerHeight: Math.max(Style.space(34), Style.font.title + Style.spacing.controlPaddingY * 2)
-  property int footerHeight: Style.font.caption + Style.space(10)
+  property int footerHeight: Style.font.caption + Style.spacing.xl
   property int contentSpacing: Style.spacing.md
   property int cardWidth: Math.min(Style.space(1000), panel.width - Style.gapsOut * 2)
   property int cardHeight: Math.min(Style.space(640), panel.height - Style.gapsOut * 2)
-  property int rowHeight: Math.max(Style.space(50), Style.font.body + Style.font.caption + Style.spacing.rowPaddingX * 2)
-  property int sectionHeight: Style.font.caption + Style.space(14)
+  property int rowHeight: Math.max(Style.space(50), Style.font.title + Style.font.bodySmall + Style.space(3) + Style.spacing.rowPaddingX * 2)
+  property int sectionHeight: Style.font.caption + Style.spacing.xxxl
+  property int iconSlot: Style.space(36)
 
   // Qt decodes these itself; anything else (HEIC, camera RAW) previews from omafind's thumbnail.
   readonly property var qtImageExts: ["jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff"]
@@ -56,6 +65,7 @@ Item {
     try { payload = JSON.parse(payloadJson || "{}") } catch (e) {}
     root.opened = true
     root.namesOnly = payload.names === true
+    pointerGate.reset()
     root.setFilter(payload.query ? String(payload.query) : "")
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
@@ -84,6 +94,7 @@ Item {
   function setFilter(text) {
     root.filterText = text
     root.userMoved = false
+    pointerGate.reset()
     root.errorText = ""
     if (text.trim().length === 0) {
       searchProc.running = false
@@ -135,6 +146,7 @@ Item {
     if (root.userMoved && root.selectedIndex >= 0 && root.selectedIndex < displayModel.count)
       keepPath = displayModel.get(root.selectedIndex).path
 
+    pointerGate.reset()
     displayModel.clear()
     var firstHit = -1
     var keepIndex = -1
@@ -192,6 +204,7 @@ Item {
       if (displayModel.get(i).rowType === "hit") {
         root.selectedIndex = i
         root.userMoved = true
+        pointerGate.reset()
         resultList.positionViewAtIndex(i, ListView.Contain)
         return
       }
@@ -242,6 +255,10 @@ Item {
     case "video": return "󰕧"
     default: return "󰈔"
     }
+  }
+
+  function formatMs(ms) {
+    return ms < 1 ? "<1 ms" : Math.round(ms) + " ms"
   }
 
   function formatDate(secs) {
@@ -370,11 +387,9 @@ Item {
             textFormat: Text.PlainText
             anchors.left: parent.left
             anchors.right: stageText.left
-            anchors.rightMargin: Style.space(12)
+            anchors.rightMargin: Style.spacing.xxl
             anchors.verticalCenter: parent.verticalCenter
-            text: root.filterText || (root.namesOnly
-                  ? "Find files by name…   kind:image  ext:pdf  after:2024-03  in:~/Documents"
-                  : "Find files by what's in them…   kind:image  ext:pdf  after:2024-03  in:~/Documents")
+            text: root.filterText || (root.namesOnly ? "Find files by name…" : "Find files…")
             color: root.foreground
             opacity: root.filterText ? 1 : 0.58
             font.family: root.fontFamily
@@ -390,13 +405,13 @@ Item {
             visible: root.filterText.length > 0 || root.namesOnly
             text: root.namesOnly
                   ? (root.searching ? "names · searching…"
-                     : root.filterText && root.stage ? "names · " + Math.round(root.elapsedMs) + " ms" : "names only")
+                     : root.filterText && root.stage ? "names · " + root.formatMs(root.elapsedMs) : "names only")
                   : root.searching && root.stage !== "deep" ? (root.stage === "fast" ? "thinking…" : "searching…")
-                  : (root.stage === "deep" ? "Gemma · " + Math.round(root.elapsedMs) + " ms" : "")
+                  : (root.stage === "deep" ? "Gemma · " + root.formatMs(root.elapsedMs) : "")
             color: root.foreground
-            opacity: 0.5
+            opacity: root.dimOpacity
             font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
+            font.pixelSize: Style.font.bodySmall
           }
         }
 
@@ -420,7 +435,7 @@ Item {
                 anchors.rightMargin: root.contentMargin
                 model: displayModel
                 clip: true
-                spacing: Style.space(2)
+                spacing: Style.spacing.xs
                 boundsBehavior: Flickable.StopAtBounds
 
                 delegate: Item {
@@ -440,45 +455,46 @@ Item {
                   width: ListView.view.width
                   height: isHeader ? root.sectionHeight : root.rowHeight
 
-                  Text {
+                  PanelSectionHeader {
                     visible: row.isHeader
-                    textFormat: Text.PlainText
                     anchors.left: parent.left
-                    anchors.leftMargin: Style.space(12)
+                    anchors.leftMargin: root.rowReservedBorderLeft + Style.spacing.rowPaddingX
                     anchors.bottom: parent.bottom
-                    anchors.bottomMargin: Style.space(3)
+                    anchors.bottomMargin: Style.spacing.xs
                     text: row.title.toUpperCase()
-                    color: root.foreground
-                    opacity: 0.5
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    font.letterSpacing: 1
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
                   }
 
-                  Rectangle {
+                  BorderSurface {
                     visible: !row.isHeader
                     anchors.fill: parent
                     radius: root.cornerRadius
                     color: row.hasCursor ? root.selectedBackground : "transparent"
+                    borderSpec: row.hasCursor ? root.selectedBorderSpec : Border.none()
 
                     Row {
                       anchors.fill: parent
-                      anchors.leftMargin: Style.space(12)
-                      anchors.rightMargin: Style.space(12)
-                      anchors.topMargin: Style.space(6)
-                      anchors.bottomMargin: Style.space(6)
-                      spacing: Style.space(10)
+                      anchors.leftMargin: root.rowReservedBorderLeft + Style.spacing.rowPaddingX
+                      anchors.rightMargin: root.rowReservedBorderRight + Style.spacing.rowPaddingX
+                      anchors.topMargin: Style.spacing.lg
+                      anchors.bottomMargin: Style.spacing.lg
+                      spacing: Style.spacing.xl
 
                       Item {
-                        width: parent.height
+                        width: root.iconSlot
                         height: parent.height
 
                         Image {
                           id: thumbImage
-                          anchors.fill: parent
+                          anchors.centerIn: parent
+                          width: Math.min(parent.width, parent.height)
+                          height: width
                           visible: row.thumb.length > 0 && status === Image.Ready
                           source: row.thumb ? Util.fileUrl(row.thumb) : ""
-                          sourceSize.width: 128
+                          // Decode at physical pixels so thumbnails stay sharp on HiDPI.
+                          sourceSize.width: width * Screen.devicePixelRatio
+                          sourceSize.height: height * Screen.devicePixelRatio
                           fillMode: Image.PreserveAspectCrop
                           asynchronous: true
                           smooth: true
@@ -487,18 +503,18 @@ Item {
                         Text {
                           anchors.centerIn: parent
                           visible: !thumbImage.visible
+                          textFormat: Text.PlainText
                           text: root.kindIcon(row.kind)
                           color: row.hasCursor ? root.selectedText : root.foreground
-                          opacity: 0.75
                           font.family: root.fontFamily
-                          font.pixelSize: Style.font.heading + 4
+                          font.pixelSize: Style.font.iconLarge
                         }
                       }
 
                       Column {
-                        width: parent.width - parent.height - parent.spacing
+                        width: parent.width - root.iconSlot - parent.spacing
                         anchors.verticalCenter: parent.verticalCenter
-                        spacing: Style.space(2)
+                        spacing: Style.space(3)
 
                         Text {
                           textFormat: Text.PlainText
@@ -514,10 +530,10 @@ Item {
                           textFormat: Text.PlainText
                           width: parent.width
                           text: row.snippet ? row.snippet : row.dir
-                          color: row.hasCursor ? root.selectedText : root.foreground
-                          opacity: 0.6
+                          color: root.foreground
+                          opacity: root.dimOpacity
                           font.family: root.fontFamily
-                          font.pixelSize: Style.font.caption
+                          font.pixelSize: Style.font.bodySmall
                           elide: Text.ElideRight
                           maximumLineCount: 1
                         }
@@ -539,6 +555,37 @@ Item {
                       }
                     }
                   }
+                }
+              }
+
+              // Scroll scrims, as in Menu: each edge fades in with how much is hidden past it.
+              Rectangle {
+                anchors.left: resultList.left
+                anchors.right: resultList.right
+                anchors.top: resultList.top
+                height: Math.min(Style.space(28), resultList.height / 2)
+                visible: opacity > 0
+                opacity: resultList.contentHeight > resultList.height
+                  ? Math.max(0, Math.min(1, (resultList.contentY - resultList.originY) / height))
+                  : 0
+                gradient: Gradient {
+                  GradientStop { position: 0; color: root.background }
+                  GradientStop { position: 1; color: Util.alpha(root.background, 0) }
+                }
+              }
+
+              Rectangle {
+                anchors.left: resultList.left
+                anchors.right: resultList.right
+                anchors.bottom: resultList.bottom
+                height: Math.min(Style.space(28), resultList.height / 2)
+                visible: opacity > 0
+                opacity: resultList.contentHeight > resultList.height
+                  ? Math.max(0, Math.min(1, (resultList.originY + resultList.contentHeight - resultList.height - resultList.contentY) / height))
+                  : 0
+                gradient: Gradient {
+                  GradientStop { position: 0; color: Util.alpha(root.background, 0) }
+                  GradientStop { position: 1; color: root.background }
                 }
               }
             }
@@ -563,7 +610,7 @@ Item {
               Column {
                 anchors.fill: parent
                 anchors.leftMargin: root.contentMargin
-                spacing: Style.space(8)
+                spacing: Style.spacing.lg
                 visible: previewPane.activeRow !== null && previewPane.activeRow.rowType === "hit"
 
                 Image {
@@ -572,7 +619,7 @@ Item {
                   width: parent.width
                   height: visible ? Math.min(parent.height * 0.62, implicitHeight > 0 ? implicitHeight : parent.height * 0.62) : 0
                   source: previewPane.imageSource
-                  sourceSize.width: 1400
+                  sourceSize.width: width * Screen.devicePixelRatio
                   fillMode: Image.PreserveAspectFit
                   horizontalAlignment: Image.AlignLeft
                   verticalAlignment: Image.AlignTop
@@ -599,9 +646,9 @@ Item {
                         ? previewPane.activeRow.dir + (previewPane.activeRow.line > 1 ? "  ·  line " + previewPane.activeRow.line : "")
                         : ""
                   color: root.foreground
-                  opacity: 0.6
+                  opacity: root.dimOpacity
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
+                  font.pixelSize: Style.font.bodySmall
                   elide: Text.ElideMiddle
                 }
 
@@ -612,9 +659,9 @@ Item {
                         ? root.formatDate(previewPane.activeRow.date) + (previewPane.activeRow.why ? "  ·  matched by " + previewPane.activeRow.why : "")
                         : ""
                   color: root.foreground
-                  opacity: 0.6
+                  opacity: root.dimOpacity
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
+                  font.pixelSize: Style.font.bodySmall
                   elide: Text.ElideRight
                 }
 
@@ -638,13 +685,14 @@ Item {
           Column {
             anchors.centerIn: parent
             width: parent.width * 0.8
-            spacing: Style.space(8)
+            spacing: Style.spacing.lg
             visible: displayModel.count === 0
 
             Text {
-              text: "󰍉"
-              color: root.selectedText
-              opacity: 0.8
+              textFormat: Text.PlainText
+              text: root.errorText ? "󰀦" : "󰍉"
+              color: root.errorText ? root.urgent : root.selectedText
+              opacity: root.errorText ? 1 : 0.8
               font.family: root.fontFamily
               font.pixelSize: Style.font.displayLarge
               horizontalAlignment: Text.AlignHCenter
@@ -659,12 +707,25 @@ Item {
                     : root.searching ? "Searching…"
                     : root.namesOnly ? "No file names match “" + root.filterText + "” (tab searches contents)"
                     : "Nothing found for “" + root.filterText + "”"
-              color: root.foreground
-              opacity: 0.7
+              color: root.errorText ? root.urgent : root.foreground
+              opacity: root.errorText ? 1 : 0.7
               font.family: root.fontFamily
               font.pixelSize: Style.font.title
               horizontalAlignment: Text.AlignHCenter
               wrapMode: Text.Wrap
+              width: parent.width
+            }
+
+            // Filters are typed in the query; show them while it is empty.
+            Text {
+              textFormat: Text.PlainText
+              visible: !root.filterText && !root.errorText
+              text: "kind:image   ext:pdf   after:2024-03   in:~/Documents"
+              color: root.foreground
+              opacity: root.dimOpacity
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              horizontalAlignment: Text.AlignHCenter
               width: parent.width
             }
           }
@@ -682,7 +743,7 @@ Item {
             text: "↵ open    alt+↵ show in folder    shift+↵ copy path    "
                   + (root.namesOnly ? "tab search contents" : "tab names only") + "    esc close"
             color: root.foreground
-            opacity: 0.45
+            opacity: root.dimOpacity
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             elide: Text.ElideRight
@@ -693,9 +754,13 @@ Item {
             textFormat: Text.PlainText
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
-            text: root.note
-            color: root.foreground
-            opacity: 0.45
+            // An error that arrives after results (e.g. the deep tier failing) shows here.
+            readonly property bool showsError: root.errorText.length > 0 && displayModel.count > 0
+            width: Math.min(implicitWidth, parent.width / 2)
+            elide: Text.ElideRight
+            text: showsError ? root.errorText : root.note
+            color: showsError ? root.urgent : root.foreground
+            opacity: showsError ? 1 : root.dimOpacity
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
           }
