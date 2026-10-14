@@ -10,6 +10,8 @@ arch=(x86_64)
 url='https://github.com/CanadaApollo6/omafind'
 license=(Apache-2.0)
 makedepends=(cargo git libheif)
+# makepkg's LTO turns the bundled C code (SQLite, Oniguruma) into GCC bitcode Rust can't link.
+options=(!lto)
 
 # Models, pinned to a commit and checked against the same SHA-256 sums omafind verifies.
 _models=(
