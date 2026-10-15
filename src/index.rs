@@ -211,6 +211,8 @@ enum Content {
         space: Space,
         /// A PDF with pages that have no text layer.
         needs_ocr: bool,
+        /// Line where each page starts (PDFs with more than one page).
+        page_lines: Vec<usize>,
     },
     Image {
         taken: Option<i64>,
@@ -967,13 +969,36 @@ fn text_content(path: &Path, kind: Kind, cfg: &Config, statics: &StaticEmbedder)
         anyhow::bail!("larger than max_text_bytes");
     }
     let extracted = extract::extract_text(path, cfg.max_text_bytes)?;
-    let chunks = chunk_text(&extracted.text);
+    let chunks = if extracted.page_lines.is_empty() {
+        chunk_text(&extracted.text)
+    } else {
+        chunk_pages(&extracted.text, &extracted.page_lines)
+    };
     let space = if kind == Kind::Code { Space::Code } else { Space::Text };
     let name = file_name(path);
     // Static models see the file name too: it often carries the topic.
     let inputs: Vec<String> = chunks.iter().map(|c| format!("{name}\n{}", c.text)).collect();
     let vecs = statics.embed(space, &inputs);
-    Ok(Content::Text { chunks, vecs, space, needs_ocr: extracted.needs_ocr })
+    Ok(Content::Text { chunks, vecs, space, needs_ocr: extracted.needs_ocr, page_lines: extracted.page_lines })
+}
+
+/// Chunks each page on its own, so a chunk's page is where its text is.
+fn chunk_pages(text: &str, page_lines: &[usize]) -> Vec<Chunk> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut chunks = Vec::new();
+    for (i, &start) in page_lines.iter().enumerate() {
+        let end = page_lines.get(i + 1).map_or(lines.len(), |&next| next - 1).min(lines.len());
+        let first = (start - 1).min(end);
+        for mut c in chunk_text(&lines[first..end].join("\n")) {
+            c.line += first;
+            chunks.push(c);
+        }
+        if chunks.len() >= crate::chunk::MAX_CHUNKS {
+            chunks.truncate(crate::chunk::MAX_CHUNKS);
+            break;
+        }
+    }
+    chunks
 }
 
 fn write_prepared(tx: &Connection, p: &Prepared) -> Result<()> {
@@ -1042,11 +1067,12 @@ fn write_prepared(tx: &Connection, p: &Prepared) -> Result<()> {
         db::clear_file_content(tx, id)?;
     }
     match &p.content {
-        Content::Text { chunks, vecs, space, .. } => {
+        Content::Text { chunks, vecs, space, page_lines, .. } => {
             let mut ins_chunk =
-                tx.prepare_cached("INSERT INTO chunks(file_id, ord, line, text) VALUES (?1, ?2, ?3, ?4)")?;
+                tx.prepare_cached("INSERT INTO chunks(file_id, ord, line, text, page) VALUES (?1, ?2, ?3, ?4, ?5)")?;
             for (i, (c, v)) in chunks.iter().zip(vecs).enumerate() {
-                ins_chunk.execute(params![id, i as i64, c.line as i64, c.text])?;
+                let page = extract::page_of(page_lines, c.line);
+                ins_chunk.execute(params![id, i as i64, c.line as i64, c.text, page])?;
                 crate::vecindex::insert(tx, tx.last_insert_rowid(), id, *space, v)?;
             }
         }
@@ -1252,6 +1278,18 @@ pub type PathSet = HashSet<PathBuf>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pdf_chunks_stay_on_their_page() {
+        // Three short pages joined as extract_text joins them: pages start on lines 1, 4, 7.
+        let text = "Page one intro\nmore one\n\nTool shed rules\nkey\n\nTomato contest";
+        let chunks = chunk_pages(text, &[1, 4, 7]);
+        let pages: Vec<_> = chunks.iter().map(|c| (extract::page_of(&[1, 4, 7], c.line), c.text.as_str())).collect();
+        assert_eq!(
+            pages,
+            vec![(Some(1), "Page one intro\nmore one"), (Some(2), "Tool shed rules\nkey"), (Some(3), "Tomato contest")]
+        );
+    }
 
     #[test]
     fn finds_encrypted_mounts() {

@@ -27,8 +27,8 @@ use crate::vecindex::StaticIndex;
 
 /// (chunk id, file id, chunk text, file name, file kind, cached Gemma vector).
 type ChunkRow = (i64, i64, String, String, String, Option<Vec<u8>>);
-/// (path, name, kind, date, thumbnail, duration).
-type FileRow = (String, String, String, i64, Option<String>, Option<f64>);
+/// (path, name, kind, date, thumbnail, duration, size, media details as JSON).
+type FileRow = (String, String, String, i64, Option<String>, Option<f64>, i64, Option<String>);
 
 const RRF_K: f64 = 60.0;
 const KEYWORD_K: usize = 100;
@@ -140,6 +140,9 @@ pub struct Hit {
     pub score: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
+    /// A longer excerpt around the match, line breaks kept, for previews.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -158,6 +161,14 @@ pub struct Hit {
     /// Audio and video length in seconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration: Option<f64>,
+    /// What a recording or video is, from its tags: "Title — Artist  ·  Album  ·  1998".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub about: Option<String>,
+    /// How it is recorded: "1920×1080", "spoken de".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// Bytes.
+    pub size: i64,
     /// Deep stage: Gemma similarity to the query above its unrelated-content level.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sim: Option<f32>,
@@ -689,12 +700,16 @@ impl Engine {
         let (where_sql, args) = filter_sql(q);
         let ids = ranked.iter().map(|r| r.0.to_string()).collect::<Vec<_>>().join(",");
         let sql = format!(
-            "SELECT id, path, name, kind, COALESCE(taken, mtime), thumb, duration FROM files WHERE id IN ({ids}) {where_sql}"
+            "SELECT id, path, name, kind, COALESCE(taken, mtime), thumb, duration, size, meta
+             FROM files WHERE id IN ({ids}) {where_sql}"
         );
         let mut rows: HashMap<i64, FileRow> = HashMap::new();
         let mut stmt = conn.prepare(&sql)?;
         let mapped = stmt.query_map(params_from_iter(args), |r| {
-            Ok((r.get::<_, i64>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))
+            Ok((
+                r.get::<_, i64>(0)?,
+                (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?),
+            ))
         })?;
         for row in mapped {
             let (id, v) = row?;
@@ -704,7 +719,8 @@ impl Engine {
             conn.prepare_cached("SELECT text, line, source, page, start_ms FROM chunks WHERE id=?1")?;
         let mut hits = Vec::new();
         for &(id, score, chunk, sig) in ranked {
-            let Some((path, name, kind, date, thumb, duration)) = rows.remove(&id) else { continue };
+            let Some((path, name, kind, date, thumb, duration, size, meta)) = rows.remove(&id) else { continue };
+            let kind = Kind::parse(&kind).unwrap_or(Kind::Other);
             let found = match chunk {
                 Some(c) => chunk_stmt
                     .query_row([c], |r| {
@@ -719,11 +735,13 @@ impl Engine {
                     .optional()?,
                 None => None,
             };
-            let (mut snippet_text, mut line, mut page, mut at_ms, mut source) = (None, None, None, None, None);
+            let (mut snippet_text, mut context_text, mut line, mut page, mut at_ms, mut source) =
+                (None, None, None, None, None, None);
             if let Some((text, l, src, p, ms)) = found {
                 snippet_text = Some(snippet(&text, toks));
-                // Line numbers mean something only in the file's own text.
-                line = (src == db::SOURCE_TEXT).then_some(l);
+                context_text = Some(context(&text, toks));
+                // Line numbers mean something only in the file's own text, and in PDFs the page says more.
+                line = (src == db::SOURCE_TEXT && p.is_none()).then_some(l);
                 (page, at_ms) = (p, ms);
                 source = match src {
                     db::SOURCE_OCR => Some("ocr"),
@@ -748,13 +766,17 @@ impl Engine {
                 dir: display_dir(&path),
                 path,
                 name,
-                kind: Kind::parse(&kind).unwrap_or(Kind::Other),
+                kind,
                 score,
                 snippet: snippet_text,
+                context: context_text,
                 line,
                 page,
                 at_ms,
                 duration,
+                about: meta.as_deref().and_then(about),
+                format: meta.as_deref().and_then(|m| format_line(kind, m)),
+                size,
                 thumb,
                 date,
                 why,
@@ -900,6 +922,7 @@ impl Engine {
                 && let Some(f) = fast.hits.iter().find(|f| f.file_id == h.file_id)
             {
                 h.snippet = f.snippet.clone();
+                h.context = f.context.clone();
                 h.line = f.line;
                 h.page = f.page;
                 h.at_ms = f.at_ms;
@@ -1277,13 +1300,7 @@ fn filter_sql(q: &Query) -> (String, Vec<rusqlite::types::Value>) {
 
 /// A short excerpt around the first query word in the chunk.
 pub fn snippet(text: &str, toks: &[String]) -> String {
-    let lower = text.to_lowercase();
-    let pos = toks
-        .iter()
-        .filter(|t| t.len() > 2 && !STOPWORDS.contains(&t.as_str()))
-        .filter_map(|t| lower.find(t.as_str()))
-        .min()
-        .unwrap_or(0);
+    let pos = first_term(text, toks);
     // `lower` can differ in byte length from `text` for some scripts; clamp to a boundary.
     let mut start = pos.saturating_sub(60).min(text.len());
     while !text.is_char_boundary(start) {
@@ -1292,6 +1309,98 @@ pub fn snippet(text: &str, toks: &[String]) -> String {
     let excerpt: String = text[start..].chars().take(360).collect();
     let collapsed = excerpt.split_whitespace().collect::<Vec<_>>().join(" ");
     if start > 0 { format!("…{collapsed}") } else { collapsed }
+}
+
+/// Up to `CONTEXT_CHARS` of `text` from a line start shortly before the first query term,
+/// with runs of blank lines squeezed to one.
+pub fn context(text: &str, toks: &[String]) -> String {
+    const CONTEXT_CHARS: usize = 1200;
+    const LEAD: usize = 240;
+    let pos = first_term(text, toks);
+    let mut start = pos.saturating_sub(LEAD).min(text.len());
+    while !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    if start > 0
+        && let Some(nl) = text[..start].rfind('\n')
+        && pos - nl <= LEAD * 2
+    {
+        start = nl + 1;
+    }
+    let mut out = String::new();
+    let mut blank = false;
+    for line in text[start..].lines() {
+        let line = line.trim_end();
+        if line.trim().is_empty() {
+            blank = !out.is_empty();
+            continue;
+        }
+        if blank {
+            out.push('\n');
+            blank = false;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(line);
+        if out.len() >= CONTEXT_CHARS {
+            break;
+        }
+    }
+    if out.len() > CONTEXT_CHARS {
+        let mut cut = CONTEXT_CHARS;
+        while !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+        out.push('…');
+    }
+    if start > 0 { format!("…{out}") } else { out }
+}
+
+/// Byte offset of the first query term in `text`, or 0.
+fn first_term(text: &str, toks: &[String]) -> usize {
+    let lower = text.to_lowercase();
+    toks.iter()
+        .filter(|t| t.len() > 2 && !STOPWORDS.contains(&t.as_str()))
+        .filter_map(|t| lower.find(t.as_str()))
+        .min()
+        .unwrap_or(0)
+}
+
+/// One line saying what a recording or video is, from its tags.
+fn about(meta: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(meta).ok()?;
+    let tag = |k: &str| v["tags"][k].as_str().map(str::trim).filter(|s| !s.is_empty());
+    let mut parts: Vec<String> = Vec::new();
+    match (tag("title"), tag("artist").or(tag("album_artist"))) {
+        (Some(t), Some(a)) => parts.push(format!("{t} — {a}")),
+        (Some(t), None) => parts.push(t.to_string()),
+        (None, Some(a)) => parts.push(a.to_string()),
+        (None, None) => {}
+    }
+    if let Some(album) = tag("album") {
+        parts.push(album.to_string());
+    }
+    if let Some(year) = tag("date").and_then(|d| d.get(..4)).filter(|y| y.chars().all(|c| c.is_ascii_digit())) {
+        parts.push(year.to_string());
+    }
+    (!parts.is_empty()).then(|| parts.join("  ·  "))
+}
+
+/// Picture size of a video and the language spoken in a recording, when it isn't English.
+fn format_line(kind: Kind, meta: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(meta).ok()?;
+    let mut parts: Vec<String> = Vec::new();
+    if kind == Kind::Video
+        && let (Some(w), Some(h)) = (v["width"].as_u64(), v["height"].as_u64())
+    {
+        parts.push(format!("{w}×{h}"));
+    }
+    if let Some(lang) = v["language"].as_str().filter(|l| !l.is_empty() && *l != "en") {
+        parts.push(format!("spoken {lang}"));
+    }
+    (!parts.is_empty()).then(|| parts.join("  ·  "))
 }
 
 pub fn display_dir(path: &str) -> String {
@@ -1370,6 +1479,26 @@ mod tests {
         let s = snippet(&text, &["sourdough".into()]);
         assert!(s.contains("sourdough starter"));
         assert!(s.starts_with('…'));
+    }
+
+    #[test]
+    fn context_starts_at_a_line_and_keeps_breaks() {
+        let text = format!("{}fn main() {{\n\n\n\n    let sourdough = 1;\n}}\n", "// filler\n".repeat(60));
+        let c = context(&text, &["sourdough".into()]);
+        assert!(c.starts_with("…// filler\n"));
+        assert!(c.contains("fn main() {\n\n    let sourdough = 1;\n}"));
+        assert_eq!(context("short", &[]), "short");
+    }
+
+    #[test]
+    fn about_lines() {
+        let song =
+            r#"{"tags":{"title":"Moonlight Sonata","artist":"Beethoven","album":"Piano Works","date":"1998-01-01"}}"#;
+        assert_eq!(about(song).unwrap(), "Moonlight Sonata — Beethoven  ·  Piano Works  ·  1998");
+        assert_eq!(format_line(Kind::Audio, song), None);
+        let clip = r#"{"width":1920,"height":1080,"language":"de"}"#;
+        assert_eq!(about(clip), None);
+        assert_eq!(format_line(Kind::Video, clip).unwrap(), "1920×1080  ·  spoken de");
     }
 
     #[test]

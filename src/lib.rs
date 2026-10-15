@@ -11,5 +11,6 @@ pub mod index;
 pub mod ipc;
 pub mod models;
 pub mod power;
+pub mod preview;
 pub mod search;
 pub mod vecindex;

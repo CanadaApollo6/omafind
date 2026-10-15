@@ -8,7 +8,7 @@ use std::sync::Once;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Vision state of a file.
 pub const VISION_NA: i64 = 0;
@@ -176,7 +176,11 @@ pub fn open(path: &Path) -> Result<Connection> {
     match version {
         None => {}
         Some(v) if v == SCHEMA_VERSION => {}
-        Some(2) => migrate_v2(&conn).context("upgrading the index to schema 3")?,
+        Some(2) => {
+            migrate_v2(&conn).context("upgrading the index to schema 3")?;
+            migrate_v3(&conn)?;
+        }
+        Some(3) => migrate_v3(&conn)?,
         Some(v) => anyhow::bail!(
             "index schema {v} is not supported by this build (expects {SCHEMA_VERSION}); run `omafind reset`"
         ),
@@ -205,6 +209,16 @@ fn migrate_v2(conn: &Connection) -> Result<()> {
          UPDATE files SET media_state={EXTRA_PENDING}, speech_state={EXTRA_PENDING} WHERE kind IN ('audio','video');"
     ))?;
     tx.commit()?;
+    Ok(())
+}
+
+/// Schema 4 records the page of PDF text. PDFs are read again on the next scan (their size
+/// no longer matches), except those whose OCR is done, which would have to be read again too.
+fn migrate_v3(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE files SET size=-1 WHERE ext='pdf' AND text_state=?1 AND ocr_state!=?2",
+        params![TEXT_DONE, EXTRA_DONE],
+    )?;
     Ok(())
 }
 

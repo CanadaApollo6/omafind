@@ -103,12 +103,19 @@ In the launcher:
 - **Shift+Enter** copies its path.
 - **Tab** switches between content search and file names only.
 
+The preview beside the results shows:
+- The matching page of a PDF, the video frame at the matching moment, the photo itself, or the cover art.
+- Song and video details (title, artist, album, year, picture size) and the file's size.
+- The text around the match, with the search words picked out. It is either the file's own text, the text read from a picture, or the transcript.
+
+`omafind preview` renders the larger pictures on demand. They are cached in `~/.cache/omafind/previews`, which keeps the 200 most recently shown.
+
 ## What gets indexed
 
 - **Documents:**
   - Text, Markdown, Org, reStructuredText, LaTeX, HTML, e-mail and subtitles.
   - CSV, Jupyter notebooks and RTF.
-  - PDF, via `pdftotext`.
+  - PDF, via `pdftotext`. Results show the page.
   - Word/Writer, PowerPoint/Impress, Excel/Calc and EPUB.
 - **Code:** about 60 languages plus Makefiles, Dockerfiles, PKGBUILDs and similar. Code uses a code-specific static model.
 - **Images:** JPEG, PNG, WebP, GIF, TIFF, BMP, AVIF and JPEG XL. HEIC/HEIF through libheif. Camera RAW (CR2/CR3, NEF, ARW, DNG, ORF, RW2, RAF and more) through the embedded preview.
@@ -146,7 +153,7 @@ The daemon keeps the index current:
   an encrypted disk anyway. Full-disk encryption (LUKS) protects the index like
   everything else.
 - **Forgetting files:** deleting a file removes it from the index. `omafind reset`
-  deletes the whole index.
+  deletes the whole index, its thumbnails and the cached previews.
 
 ## Resource use
 
@@ -246,9 +253,7 @@ above that level. Tune with `search.text_margin` and `search.image_margin`.
 
 ## Roadmap
 
-- **Phase 2:**
-  - Richer previews.
-  - Labels for people and pets.
+- **Phase 2:** labels for people and pets.
 - External and removable drives with their own index.
 
 ## License

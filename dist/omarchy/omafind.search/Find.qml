@@ -153,7 +153,8 @@ Item {
     for (var g = 0; g < groups.length; g++) {
       var group = groups[g]
       displayModel.append({ rowType: "header", title: group.title, kind: group.kind, name: "", dir: "", path: "",
-                            snippet: "", thumb: "", place: "", why: "", date: 0 })
+                            snippet: "", context: "", about: "", format: "", thumb: "", place: "", why: "", date: 0, size: 0,
+                            page: 0, atMs: -1, duration: 0 })
       for (var i = 0; i < group.hits.length; i++) {
         var h = group.hits[i]
         if (firstHit < 0) firstHit = displayModel.count
@@ -166,10 +167,17 @@ Item {
           dir: h.dir,
           path: h.path,
           snippet: h.snippet || "",
+          context: h.context || "",
+          about: h.about || "",
+          format: h.format || "",
           thumb: h.thumb || "",
           place: root.formatPlace(h),
           why: (h.why || []).map(function(w) { return root.whyLabels[w] || w }).join(", "),
-          date: h.date || 0
+          date: h.date || 0,
+          size: h.size || 0,
+          page: h.page || 0,
+          atMs: h.at_ms !== undefined && h.at_ms !== null ? h.at_ms : -1,
+          duration: h.duration || 0
         })
       }
     }
@@ -239,11 +247,92 @@ Item {
     Quickshell.execDetached(["wl-copy", row.path])
   }
 
+  function extOf(row) {
+    return row.name.indexOf(".") >= 0 ? row.name.split(".").pop().toLowerCase() : ""
+  }
+
+  // What to show while a larger picture renders, or instead of one: the photo itself when Qt
+  // decodes it, else the index thumbnail (video frame, cover art, HEIC).
   function previewSource(row) {
-    if (!row || row.kind !== "image") return ""
-    var ext = row.name.indexOf(".") >= 0 ? row.name.split(".").pop().toLowerCase() : ""
-    if (root.qtImageExts.indexOf(ext) >= 0) return Util.fileUrl(row.path)
+    if (!row || row.rowType !== "hit") return ""
+    if (row.kind === "image" && root.qtImageExts.indexOf(root.extOf(row)) >= 0) return Util.fileUrl(row.path)
     return row.thumb ? Util.fileUrl(row.thumb) : ""
+  }
+
+  // `omafind preview` arguments for a larger picture than the index keeps: the matching PDF
+  // page, the video frame at the matching moment (or midway), a photo Qt can't decode.
+  function renderArgs(row) {
+    if (!row || row.rowType !== "hit") return null
+    var ext = root.extOf(row)
+    if (ext === "pdf") return ["--page", String(row.page || 1), "--", row.path]
+    if (row.kind === "video") return row.atMs >= 0 ? ["--at-ms", String(row.atMs), "--", row.path] : ["--", row.path]
+    if (row.kind === "image" && root.qtImageExts.indexOf(ext) < 0) return ["--", row.path]
+    return null
+  }
+
+  // Rendered pictures by request, so moving back to a result shows it at once.
+  property var rendered: ({})
+  property string renderKey: ""
+
+  function requestRender(row) {
+    var args = root.renderArgs(row)
+    root.renderKey = args ? args.join("\u0001") : ""
+    renderProc.running = false
+    if (!args || root.rendered[root.renderKey] !== undefined) return
+    renderDelay.restart()
+  }
+
+  function startRender() {
+    var args = root.renderKey ? root.renderKey.split("\u0001") : []
+    if (args.length === 0) return
+    renderProc.key = root.renderKey
+    renderProc.command = ["sh", "-c", "PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:$PATH\" exec \"$0\" preview \"$@\"",
+                          root.omafindCommand].concat(args)
+    renderProc.running = true
+  }
+
+  function formatSize(bytes) {
+    if (!bytes) return ""
+    var units = ["B", "KB", "MB", "GB", "TB"]
+    var i = 0, v = bytes
+    while (v >= 1000 && i < units.length - 1) { v /= 1000; i++ }
+    return (i === 0 || v >= 100 ? Math.round(v) : v.toFixed(1)) + " " + units[i]
+  }
+
+  // Query words worth highlighting: no filters (kind:, ext:, …), no short words.
+  function queryTerms() {
+    return root.sentQuery.toLowerCase().split(/\s+/)
+      .filter(function(w) { return w.indexOf(":") < 0 })
+      .map(function(w) { return w.replace(/[^\w\u00c0-\u024f-]/g, "") })
+      .filter(function(w) { return w.length > 2 })
+  }
+
+  function escapeHtml(text) {
+    return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+  }
+
+  // The context as styled text: query words that start a word stand out, line breaks and
+  // (for code) indentation are kept.
+  function styledContext(text, code) {
+    if (!text) return ""
+    var html = root.escapeHtml(text.replace(/\t/g, "    "))
+    var terms = root.queryTerms()
+    if (terms.length > 0) {
+      var re = new RegExp("(^|[^\\w\\u00c0-\\u024f])(" + terms.map(function(t) {
+        return t.replace(/-/g, "\\-")
+      }).join("|") + ")", "gi")
+      html = html.replace(re, function(m, before, word) {
+        return before + "<font color=\"" + root.selectedText + "\"><b>" + word + "</b></font>"
+      })
+    }
+    var lines = html.split("\n")
+    if (code) {
+      lines = lines.map(function(l) {
+        var lead = l.match(/^ */)[0].length
+        return "&nbsp;".repeat(lead) + l.slice(lead)
+      })
+    }
+    return lines.join("<br>")
   }
 
   function kindIcon(kind) {
@@ -277,7 +366,8 @@ Item {
     var parts = []
     if (h.line > 1) parts.push("line " + h.line)
     if (h.page) parts.push("page " + h.page)
-    if (h.at_ms !== undefined && h.at_ms !== null) parts.push("at " + root.formatClock(h.at_ms / 1000))
+    // From the first second on: "at 0:00" says nothing.
+    if (h.at_ms >= 1000) parts.push("at " + root.formatClock(h.at_ms / 1000))
     if (h.duration) parts.push(root.formatClock(h.duration) + " long")
     return parts.join("  ·  ")
   }
@@ -288,6 +378,38 @@ Item {
   }
 
   ListModel { id: displayModel }
+
+  // A short pause before rendering, so paging through results doesn't start a render for each.
+  Timer {
+    id: renderDelay
+    interval: 90
+    repeat: false
+    onTriggered: root.startRender()
+  }
+
+  Process {
+    id: renderProc
+    property string key: ""
+    running: false
+    stdout: SplitParser {
+      onRead: function(data) {
+        var path = String(data).trim()
+        if (!path) return
+        var next = Object.assign({}, root.rendered)
+        next[renderProc.key] = Util.fileUrl(path)
+        root.rendered = next
+      }
+    }
+    // A file that can't be rendered (damaged, a tool missing) keeps its thumbnail.
+    onExited: function(code) {
+      // A render stopped because the selection moved on is simply asked for again later.
+      if (code !== 0 && renderProc.key === root.renderKey && root.rendered[renderProc.key] === undefined) {
+        var next = Object.assign({}, root.rendered)
+        next[renderProc.key] = ""
+        root.rendered = next
+      }
+    }
+  }
 
   PointerMoveGate {
     id: pointerGate
@@ -618,7 +740,15 @@ Item {
               clip: true
 
               property var activeRow: root.selectedIndex >= 0 && root.selectedIndex < displayModel.count ? displayModel.get(root.selectedIndex) : null
-              property string imageSource: root.previewSource(activeRow)
+              readonly property bool isHit: activeRow !== null && activeRow.rowType === "hit"
+              property string renderedSource: root.renderKey && root.rendered[root.renderKey] ? root.rendered[root.renderKey] : ""
+              property string imageSource: renderedSource || root.previewSource(activeRow)
+              property string contextText: isHit ? (activeRow.context || activeRow.snippet) : ""
+              readonly property bool isCode: isHit && activeRow.kind === "code"
+              // Cover art stays small; a page or a frame gets more room unless there's text to read.
+              readonly property real imageShare: !isHit ? 0 : activeRow.kind === "audio" ? 0.34 : contextText ? 0.5 : 0.66
+
+              onActiveRowChanged: root.requestRender(activeRow)
 
               Rectangle {
                 anchors.left: parent.left
@@ -632,13 +762,13 @@ Item {
                 anchors.fill: parent
                 anchors.leftMargin: root.contentMargin
                 spacing: Style.spacing.lg
-                visible: previewPane.activeRow !== null && previewPane.activeRow.rowType === "hit"
+                visible: previewPane.isHit
 
                 Image {
                   id: previewImage
                   visible: previewPane.imageSource.length > 0
                   width: parent.width
-                  height: visible ? Math.min(parent.height * 0.62, implicitHeight > 0 ? implicitHeight : parent.height * 0.62) : 0
+                  height: visible ? Math.min(parent.height * previewPane.imageShare, implicitHeight > 0 ? implicitHeight : parent.height * previewPane.imageShare) : 0
                   source: previewPane.imageSource
                   sourceSize.width: width * Screen.devicePixelRatio
                   fillMode: Image.PreserveAspectFit
@@ -673,11 +803,25 @@ Item {
                   elide: Text.ElideMiddle
                 }
 
+                // Song or video details: "Title — Artist  ·  Album  ·  1998", "1920×1080".
+                Text {
+                  textFormat: Text.PlainText
+                  visible: text.length > 0
+                  width: parent.width
+                  text: previewPane.isHit ? previewPane.activeRow.about : ""
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  elide: Text.ElideRight
+                }
+
                 Text {
                   textFormat: Text.PlainText
                   width: parent.width
-                  text: previewPane.activeRow
-                        ? root.formatDate(previewPane.activeRow.date) + (previewPane.activeRow.why ? "  ·  matched by " + previewPane.activeRow.why : "")
+                  text: previewPane.isHit
+                        ? [root.formatDate(previewPane.activeRow.date), root.formatSize(previewPane.activeRow.size),
+                           previewPane.activeRow.format]
+                            .filter(function(p) { return p.length > 0 }).join("  ·  ")
                         : ""
                   color: root.foreground
                   opacity: root.dimOpacity
@@ -688,16 +832,31 @@ Item {
 
                 Text {
                   textFormat: Text.PlainText
-                  visible: !previewImage.visible && text.length > 0
+                  visible: text.length > 0
                   width: parent.width
-                  height: parent.height - y
-                  text: previewPane.activeRow ? previewPane.activeRow.snippet : ""
+                  text: previewPane.isHit && previewPane.activeRow.why ? "matched by " + previewPane.activeRow.why : ""
                   color: root.foreground
+                  opacity: root.dimOpacity
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
-                  wrapMode: Text.Wrap
+                  font.pixelSize: Style.font.bodySmall
                   elide: Text.ElideRight
-                  lineHeight: 1.15
+                }
+
+                // The text around the match: the file's own, or read from the picture or the recording.
+                Text {
+                  textFormat: Text.StyledText
+                  visible: text.length > 0 && height > font.pixelSize
+                  width: parent.width
+                  height: Math.max(0, parent.height - y)
+                  clip: true
+                  text: root.styledContext(previewPane.contextText, previewPane.isCode)
+                  color: root.foreground
+                  opacity: 0.86
+                  font.family: previewPane.isCode ? Style.font.family : root.fontFamily
+                  font.pixelSize: previewPane.isCode ? Style.font.bodySmall : Style.font.body
+                  wrapMode: previewPane.isCode ? Text.NoWrap : Text.Wrap
+                  elide: previewPane.isCode ? Text.ElideNone : Text.ElideRight
+                  lineHeight: previewPane.isCode ? 1.05 : 1.15
                 }
               }
             }

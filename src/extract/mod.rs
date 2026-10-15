@@ -211,17 +211,39 @@ pub struct Extracted {
     pub title: Option<String>,
     /// Some pages are scans or pictures without a text layer (PDF only).
     pub needs_ocr: bool,
+    /// Line (1-based) where each page starts, for documents with more than one page.
+    pub page_lines: Vec<usize>,
+}
+
+/// The page (1-based) that `line` is on, if the document has pages.
+pub fn page_of(page_lines: &[usize], line: usize) -> Option<i64> {
+    (!page_lines.is_empty()).then(|| page_lines.partition_point(|&l| l <= line).max(1) as i64)
 }
 
 /// Reads the text content of a document or code file.
 pub fn extract_text(path: &Path, max_bytes: u64) -> Result<Extracted> {
     let ext = ext_of(path);
     let mut needs_ocr = false;
+    let mut page_lines = Vec::new();
     let text = match ext.as_str() {
         "pdf" => {
             let pages = pdf::pages(path)?;
             needs_ocr = !pdf::pages_without_text(&pages).is_empty();
-            pages.join("\n\n")
+            let mut text = String::new();
+            let mut newlines = 0;
+            for (i, page) in pages.iter().enumerate() {
+                if i > 0 {
+                    text.push_str("\n\n");
+                    newlines += 2;
+                }
+                page_lines.push(newlines + 1);
+                text.push_str(page);
+                newlines += page.matches('\n').count();
+            }
+            if page_lines.len() < 2 {
+                page_lines.clear();
+            }
+            text
         }
         "docx" | "pptx" | "odt" | "odp" | "epub" => office::extract_zip_doc(path, &ext)?,
         "xlsx" | "xlsm" | "xls" | "ods" => office::extract_sheet(path)?,
@@ -239,7 +261,7 @@ pub fn extract_text(path: &Path, max_bytes: u64) -> Result<Extracted> {
         text.truncate(cut);
     }
     let title = text::guess_title(&text, &ext);
-    Ok(Extracted { text, title, needs_ocr })
+    Ok(Extracted { text, title, needs_ocr, page_lines })
 }
 
 #[cfg(test)]
@@ -257,5 +279,16 @@ mod tests {
         assert_eq!(kind_of(Path::new("/a/x.bin")), Kind::Other);
         assert_eq!(Kind::parse("images"), Some(Kind::Image));
         assert_eq!(Kind::parse("docs"), Some(Kind::Document));
+    }
+
+    #[test]
+    fn lines_map_to_pages() {
+        // Pages start on lines 1, 4 and 9.
+        let starts = [1, 4, 9];
+        assert_eq!(page_of(&starts, 1), Some(1));
+        assert_eq!(page_of(&starts, 3), Some(1));
+        assert_eq!(page_of(&starts, 4), Some(2));
+        assert_eq!(page_of(&starts, 20), Some(3));
+        assert_eq!(page_of(&[], 5), None);
     }
 }

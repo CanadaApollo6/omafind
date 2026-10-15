@@ -63,6 +63,17 @@ enum Cmd {
     },
     /// Run the background service: watches for changes and answers searches.
     Daemon,
+    /// Render a large preview picture (a PDF page, a video frame, a HEIC or RAW photo) and
+    /// print its path. Used by the launcher; pictures are cached.
+    Preview {
+        path: PathBuf,
+        /// PDF page (1-based).
+        #[arg(long)]
+        page: Option<u32>,
+        /// Video position, in milliseconds.
+        #[arg(long)]
+        at_ms: Option<i64>,
+    },
     /// Show index and daemon status.
     Status {
         #[arg(long)]
@@ -127,7 +138,7 @@ enum ModelsCmd {
 
 fn main() {
     let cli = Cli::parse();
-    let quiet = matches!(cli.cmd, Cmd::Search { .. } | Cmd::Status { .. } | Cmd::Config { .. });
+    let quiet = matches!(cli.cmd, Cmd::Search { .. } | Cmd::Status { .. } | Cmd::Config { .. } | Cmd::Preview { .. });
     let default = if quiet { "omafind=warn" } else { "omafind=info" };
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_env("OMAFIND_LOG").unwrap_or_else(|_| default.into()))
@@ -163,6 +174,10 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Index { no_images } => index(&cfg, no_images),
         Cmd::Daemon => daemon::run(cfg),
+        Cmd::Preview { path, page, at_ms } => {
+            println!("{}", omafind::preview::render(&cfg, &path, page, at_ms)?.display());
+            Ok(())
+        }
         Cmd::Status { json } => status(&cfg, json),
         Cmd::Models { cmd: ModelsCmd::Fetch { precision, no_code, no_audio, no_speech } } => {
             let precisions = if precision.is_empty() {
@@ -213,7 +228,8 @@ fn run(cli: Cli) -> Result<()> {
                     let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
                 }
                 let _ = std::fs::remove_dir_all(config::thumbs_dir());
-                println!("Deleted {} and the thumbnail cache.", path.display());
+                let _ = std::fs::remove_dir_all(omafind::preview::previews_dir());
+                println!("Deleted {} and the picture caches.", path.display());
             }
             Ok(())
         }
@@ -289,7 +305,13 @@ fn print_results(v: Option<&serde_json::Value>) {
     for g in groups {
         println!("\x1b[1m{}\x1b[0m", g["title"].as_str().unwrap_or(""));
         for h in g["hits"].as_array().into_iter().flatten() {
-            let line = h["line"].as_i64().map(|l| format!(":{l}")).unwrap_or_default();
+            // Where the match is: a line, a PDF page, a moment in a recording.
+            let line = match (h["line"].as_i64(), h["page"].as_i64(), h["at_ms"].as_i64()) {
+                (Some(l), _, _) => format!(":{l}"),
+                (_, Some(p), _) => format!(" (page {p})"),
+                (_, _, Some(ms)) if ms >= 1000 => format!(" (at {}:{:02})", ms / 60_000, ms / 1000 % 60),
+                _ => String::new(),
+            };
             println!(
                 "  {}{}  \x1b[2m{}\x1b[0m",
                 h["name"].as_str().unwrap_or(""),
