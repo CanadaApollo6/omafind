@@ -1,7 +1,8 @@
 //! Model registry, lookup and download.
 //!
-//! omafind ships three models: two Model2Vec static models for the fast tier and the
-//! EmbeddingGemma 2 ONNX export (text and vision encoders only) for the deep tier.
+//! omafind uses two Model2Vec static models for the fast tier, the EmbeddingGemma 2 ONNX
+//! export (text, vision and audio encoders) for the deep tier and, for transcripts, a
+//! whisper.cpp model with its voice-activity detector.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -37,6 +38,13 @@ pub const STATIC_CODE: ModelSpec = ModelSpec {
 pub const GEMMA_DIR: &str = "embeddinggemma-2";
 pub const GEMMA_REPO: &str = "onnx-community/embeddinggemma-2-ONNX";
 pub const GEMMA_REV: &str = "daa72c51243991dfcaf9f9137d2c573d8f7790c0";
+
+pub const WHISPER_DIR: &str = "whisper";
+pub const WHISPER_REPO: &str = "ggerganov/whisper.cpp";
+pub const WHISPER_REV: &str = "5359861c739e955e79d9a303bcbc70fb988958b1";
+pub const VAD_REPO: &str = "ggml-org/whisper-vad";
+pub const VAD_REV: &str = "9ffd54a1e1ee413ddf265af9913beaf518d1639b";
+pub const VAD_FILE: &str = "ggml-silero-v6.2.0.bin";
 
 /// Size and SHA-256 of every file `fetch` may download, as `dir/file`. Model files are
 /// executable input to ONNX Runtime, so nothing unverified is put in place.
@@ -105,7 +113,53 @@ pub const CHECKSUMS: &[(&str, u64, &str)] = &[
         671026176,
         "ca8d28c99feb8129618f141978a27adae25090e0dadb68a30c235e191c01e37e",
     ),
+    (
+        "embeddinggemma-2/onnx/audio_encoder_quantized.onnx",
+        249330,
+        "04a9a9094ba76fb169e4c69be45a4b621580188654d6be59eab860eadcd42d3c",
+    ),
+    (
+        "embeddinggemma-2/onnx/audio_encoder_quantized.onnx_data",
+        340058624,
+        "aa6361d898e1f1d6303f8dd2b5fabf4fd3629e15fd709e9cb06ac5cb9416a030",
+    ),
+    (
+        "embeddinggemma-2/onnx/audio_encoder.onnx",
+        204577,
+        "e0a62590c49949fe0b1410f5dc52c92a185abb4c4e69e2c50a4e316103fdbc09",
+    ),
+    (
+        "embeddinggemma-2/onnx/audio_encoder.onnx_data",
+        1172750848,
+        "6943b910d1d1e9b5dffd4ccad63f61aa308ad10b70ed128bb61886b119da1e3a",
+    ),
+    ("whisper/ggml-base-q5_1.bin", 59707625, "422f1ae452ade6f30a004d7e5c6a43195e4433bc370bf23fac9cc591f01a8898"),
+    ("whisper/ggml-small-q5_1.bin", 190085487, "ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb"),
+    (
+        "whisper/ggml-large-v3-turbo-q5_0.bin",
+        574041195,
+        "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
+    ),
+    ("whisper/ggml-silero-v6.2.0.bin", 885098, "2aa269b785eeb53a82983a20501ddf7c1d9c48e33ab63a41391ac6c9f7fb6987"),
 ];
+
+/// whisper.cpp model file for `indexing.speech_model`.
+pub fn whisper_file(model: &str) -> Option<&'static str> {
+    Some(match model {
+        "base" => "ggml-base-q5_1.bin",
+        "small" => "ggml-small-q5_1.bin",
+        "large-v3-turbo" => "ggml-large-v3-turbo-q5_0.bin",
+        _ => return None,
+    })
+}
+
+/// The speech model and the voice-activity model, if downloaded.
+pub fn find_whisper(model: &str) -> Option<(PathBuf, Option<PathBuf>)> {
+    let file = whisper_file(model)?;
+    let dir = find(WHISPER_DIR, &[file.to_string()])?;
+    let vad = find(WHISPER_DIR, &[VAD_FILE.to_string()]).map(|d| d.join(VAD_FILE));
+    Some((dir.join(file), vad))
+}
 
 fn checksum(dir: &str, file: &str) -> Option<(u64, &'static str)> {
     let key = format!("{dir}/{file}");
@@ -141,19 +195,41 @@ pub fn find_static(spec: &ModelSpec) -> Result<PathBuf> {
     find(spec.dir, &files).with_context(|| format!("static model {} not found; run `omafind models fetch`", spec.dir))
 }
 
+/// Audio encoder graph for a text-model precision. 4-bit costs audio the most quality, so
+/// q4 installs pair with the 8-bit audio encoder.
+pub fn gemma_audio_files(precision: &str) -> Vec<String> {
+    let suffix = precision_suffix(if precision == "q4" { "quantized" } else { precision });
+    vec![format!("onnx/audio_encoder{suffix}.onnx"), format!("onnx/audio_encoder{suffix}.onnx_data")]
+}
+
+/// The audio encoder's graph, if it was downloaded.
+pub fn find_gemma_audio(precision: &str) -> Option<PathBuf> {
+    let files = gemma_audio_files(precision);
+    find(GEMMA_DIR, &files).map(|d| d.join(&files[0]))
+}
+
 pub fn find_gemma(precision: &str) -> Result<PathBuf> {
     find(GEMMA_DIR, &gemma_files(precision)).with_context(|| {
         format!("EmbeddingGemma 2 ({precision}) not found; run `omafind models fetch --precision {precision}`")
     })
 }
 
+/// What `fetch` downloads besides the static text model.
+pub struct FetchOpts {
+    pub code: bool,
+    /// Gemma's audio encoder.
+    pub audio: bool,
+    /// whisper.cpp model name (`indexing.speech_model`).
+    pub speech: Option<String>,
+}
+
 /// Downloads the given models into the user models dir, skipping files already present.
-pub fn fetch(precisions: &[String], include_code: bool) -> Result<()> {
+pub fn fetch(precisions: &[String], opts: &FetchOpts) -> Result<()> {
     let base = config::user_models_dir();
     // (repo, rev, dir, file)
     let mut jobs: Vec<(&str, &str, &str, String)> = Vec::new();
     let mut specs = vec![&STATIC_TEXT];
-    if include_code {
+    if opts.code {
         specs.push(&STATIC_CODE);
     }
     for spec in specs {
@@ -166,9 +242,18 @@ pub fn fetch(precisions: &[String], include_code: bool) -> Result<()> {
             matches!(p.as_str(), "q4" | "quantized" | "fp32"),
             "unknown precision {p} (q4, quantized, fp32)"
         );
-        for f in gemma_files(p) {
+        let mut files = gemma_files(p);
+        if opts.audio {
+            files.extend(gemma_audio_files(p));
+        }
+        for f in files {
             jobs.push((GEMMA_REPO, GEMMA_REV, GEMMA_DIR, f));
         }
+    }
+    if let Some(model) = &opts.speech {
+        let file = whisper_file(model).with_context(|| format!("unknown speech model {model}"))?;
+        jobs.push((WHISPER_REPO, WHISPER_REV, WHISPER_DIR, file.to_string()));
+        jobs.push((VAD_REPO, VAD_REV, WHISPER_DIR, VAD_FILE.to_string()));
     }
     jobs.sort();
     jobs.dedup();
@@ -242,6 +327,12 @@ pub fn describe() -> Vec<(String, Option<PathBuf>)> {
     for p in ["q4", "quantized", "fp32"] {
         out.push((format!("{GEMMA_DIR} ({p})"), find(GEMMA_DIR, &gemma_files(p))));
     }
+    for p in ["quantized", "fp32"] {
+        out.push((format!("{GEMMA_DIR} audio ({p})"), find_gemma_audio(p)));
+    }
+    for m in ["base", "small", "large-v3-turbo"] {
+        out.push((format!("whisper {m}"), find_whisper(m).map(|w| w.0)));
+    }
     out
 }
 
@@ -257,9 +348,13 @@ mod tests {
             }
         }
         for p in ["q4", "quantized", "fp32"] {
-            for f in gemma_files(p) {
+            for f in gemma_files(p).into_iter().chain(gemma_audio_files(p)) {
                 assert!(checksum(GEMMA_DIR, &f).is_some(), "{GEMMA_DIR}/{f}");
             }
         }
+        for m in ["base", "small", "large-v3-turbo"] {
+            assert!(checksum(WHISPER_DIR, whisper_file(m).unwrap()).is_some(), "{m}");
+        }
+        assert!(checksum(WHISPER_DIR, VAD_FILE).is_some());
     }
 }

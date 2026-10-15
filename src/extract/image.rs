@@ -175,6 +175,18 @@ pub fn taken(path: &Path) -> Option<i64> {
     Some(t.and_utc().timestamp())
 }
 
+/// Taken with a camera or phone (EXIF names the device), as opposed to a screenshot, scan or
+/// download. Camera RAW files always count.
+pub fn is_camera_photo(path: &Path) -> bool {
+    if super::RAW.contains(&super::ext_of(path).as_str()) {
+        return true;
+    }
+    read_exif(path).is_some_and(|e| {
+        e.get_field(exif::Tag::Make, exif::In::PRIMARY).is_some()
+            || e.get_field(exif::Tag::Model, exif::In::PRIMARY).is_some()
+    })
+}
+
 /// Writes a small JPEG thumbnail.
 pub fn write_thumbnail(img: &DynamicImage, dest: &Path) -> Result<()> {
     if let Some(dir) = dest.parent() {

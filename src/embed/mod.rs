@@ -1,5 +1,6 @@
 //! Embedding models: static (fast tier) and EmbeddingGemma 2 (deep tier).
 
+pub mod audio;
 pub mod gemma;
 pub mod static_model;
 

@@ -1,9 +1,13 @@
 //! File kinds and content readers.
 
 pub mod image;
+pub mod media;
+pub mod ocr;
 pub mod office;
 pub mod pdf;
+pub mod speech;
 pub mod text;
+pub mod tool;
 
 use std::path::Path;
 
@@ -205,13 +209,20 @@ pub fn kind_of(path: &Path) -> Kind {
 pub struct Extracted {
     pub text: String,
     pub title: Option<String>,
+    /// Some pages are scans or pictures without a text layer (PDF only).
+    pub needs_ocr: bool,
 }
 
 /// Reads the text content of a document or code file.
 pub fn extract_text(path: &Path, max_bytes: u64) -> Result<Extracted> {
     let ext = ext_of(path);
+    let mut needs_ocr = false;
     let text = match ext.as_str() {
-        "pdf" => pdf::extract(path)?,
+        "pdf" => {
+            let pages = pdf::pages(path)?;
+            needs_ocr = !pdf::pages_without_text(&pages).is_empty();
+            pages.join("\n\n")
+        }
         "docx" | "pptx" | "odt" | "odp" | "epub" => office::extract_zip_doc(path, &ext)?,
         "xlsx" | "xlsm" | "xls" | "ods" => office::extract_sheet(path)?,
         "html" | "htm" | "xhtml" => text::strip_html(&text::read_text(path, max_bytes)?),
@@ -228,7 +239,7 @@ pub fn extract_text(path: &Path, max_bytes: u64) -> Result<Extracted> {
         text.truncate(cut);
     }
     let title = text::guess_title(&text, &ext);
-    Ok(Extracted { text, title })
+    Ok(Extracted { text, title, needs_ocr })
 }
 
 #[cfg(test)]

@@ -28,6 +28,8 @@ const DEBOUNCE: Duration = Duration::from_millis(1500);
 const IDLE_POLL: Duration = Duration::from_secs(30);
 const VISION_STEP: usize = 4;
 const GEMMA_TEXT_STEP: usize = 8;
+const OCR_STEP: usize = 2;
+const MEDIA_STEP: usize = 1;
 
 enum Control {
     Rescan,
@@ -218,6 +220,29 @@ impl Watches {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Lane {
+    Text,
+    Images,
+    Ocr,
+    Media,
+    Speech,
+}
+
+const LANES: [Lane; 5] = [Lane::Text, Lane::Images, Lane::Ocr, Lane::Media, Lane::Speech];
+
+impl Lane {
+    fn phase(self) -> &'static str {
+        match self {
+            Lane::Text => "embedding text",
+            Lane::Images => "embedding images",
+            Lane::Ocr => "reading text in images",
+            Lane::Media => "embedding audio and video",
+            Lane::Speech => "transcribing speech",
+        }
+    }
+}
+
 fn index_loop(mut indexer: Indexer, control: Receiver<Control>, s: &Shared) -> Result<()> {
     power::lower_current_thread_priority();
     let own = Mutex::new(OwnLoad::new());
@@ -228,8 +253,12 @@ fn index_loop(mut indexer: Indexer, control: Receiver<Control>, s: &Shared) -> R
     };
 
     let (ev_tx, events) = crossbeam_channel::unbounded();
-    let watcher = notify::recommended_watcher(move |res| {
-        let _ = ev_tx.send(res);
+    let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        // Reads change nothing, and the indexer's own reads would otherwise look like new work
+        // arriving and interrupt it.
+        if !res.as_ref().is_ok_and(|ev| matches!(ev.kind, notify::EventKind::Access(_))) {
+            let _ = ev_tx.send(res);
+        }
     })?;
     let mut watches = Watches { watcher, dirs: HashSet::new(), warned: false };
 
@@ -246,7 +275,8 @@ fn index_loop(mut indexer: Indexer, control: Receiver<Control>, s: &Shared) -> R
     let mut last_event = Instant::now();
     let mut full_rescan = false;
     let mut idle_work = true;
-    let mut text_turn = false;
+    // The idle lanes take turns, so a long run of one kind of work never starves the others.
+    let mut turn = 0usize;
 
     loop {
         let timeout = if !pending.is_empty() {
@@ -265,10 +295,8 @@ fn index_loop(mut indexer: Indexer, control: Receiver<Control>, s: &Shared) -> R
                     if ev.need_rescan() {
                         full_rescan = true;
                     }
-                    if !matches!(ev.kind, notify::EventKind::Access(_)) {
-                        pending.extend(ev.paths);
-                        last_event = Instant::now();
-                    }
+                    pending.extend(ev.paths);
+                    last_event = Instant::now();
                     continue;
                 }
                 Ok(Err(e)) => tracing::warn!("watch error: {e}"),
@@ -316,37 +344,37 @@ fn index_loop(mut indexer: Indexer, control: Receiver<Control>, s: &Shared) -> R
                 set_phase("paused (power budget)");
                 continue;
             }
-            // Alternate between images and text vectors so neither starves the other.
             let stop = || !events.is_empty() || !control.is_empty();
             let mut did = 0;
-            for step in 0..2 {
-                if (step == 0) == text_turn {
-                    set_phase("embedding text");
-                    did += indexer.gemma_text_pass(GEMMA_TEXT_STEP).unwrap_or_else(|e| {
-                        tracing::warn!("gemma text pass: {e:#}");
-                        0
-                    });
-                } else {
-                    set_phase("embedding images");
-                    did += indexer.vision_pass(VISION_STEP, &stop).unwrap_or_else(|e| {
-                        tracing::warn!("vision pass: {e:#}");
-                        0
-                    });
-                }
+            for i in 0..LANES.len() {
+                let lane = LANES[(turn + i) % LANES.len()];
+                set_phase(lane.phase());
+                let result = match lane {
+                    Lane::Text => indexer.gemma_text_pass(GEMMA_TEXT_STEP),
+                    Lane::Images => indexer.vision_pass(VISION_STEP, &stop),
+                    Lane::Ocr => indexer.ocr_pass(OCR_STEP, &stop),
+                    Lane::Media => indexer.media_pass(MEDIA_STEP, &stop),
+                    Lane::Speech => indexer.speech_pass(&stop),
+                };
+                did += result.unwrap_or_else(|e| {
+                    tracing::warn!("{} failed: {e:#}", lane.phase());
+                    0
+                });
                 if did > 0 {
                     break;
                 }
             }
-            text_turn = !text_turn;
-            if did == 0 {
+            turn = (turn + 1) % LANES.len();
+            // Interrupted by an event: handle it, then come back.
+            if did == 0 && !stop() {
                 idle_work = false;
                 if let Some(g) = s.gemma.loaded() {
-                    g.unload_vision();
+                    g.unload_encoders();
                 }
                 tracing::info!("index is up to date");
             }
-        } else if indexer.pending_images().unwrap_or(0) > 0 {
-            // Woken by the poll interval while images wait (e.g. after a power-budget pause).
+        } else if indexer.pending().is_ok_and(|p| p.any()) {
+            // Woken by the poll interval while work waits (e.g. after a power-budget pause).
             idle_work = true;
         }
     }

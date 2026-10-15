@@ -27,6 +27,10 @@ _models=(
   'embeddinggemma-2/onnx/model_q4.onnx_data'
   'embeddinggemma-2/onnx/vision_encoder_q4.onnx'
   'embeddinggemma-2/onnx/vision_encoder_q4.onnx_data'
+  'embeddinggemma-2/onnx/audio_encoder_quantized.onnx'
+  'embeddinggemma-2/onnx/audio_encoder_quantized.onnx_data'
+  'whisper/ggml-base-q5_1.bin'
+  'whisper/ggml-silero-v6.2.0.bin'
 )
 source=(
   'omafind::git+https://github.com/CanadaApollo6/omafind.git'
@@ -42,6 +46,10 @@ source=(
   'embeddinggemma-2__onnx__model_q4.onnx_data::https://huggingface.co/onnx-community/embeddinggemma-2-ONNX/resolve/daa72c51243991dfcaf9f9137d2c573d8f7790c0/onnx/model_q4.onnx_data'
   'embeddinggemma-2__onnx__vision_encoder_q4.onnx::https://huggingface.co/onnx-community/embeddinggemma-2-ONNX/resolve/daa72c51243991dfcaf9f9137d2c573d8f7790c0/onnx/vision_encoder_q4.onnx'
   'embeddinggemma-2__onnx__vision_encoder_q4.onnx_data::https://huggingface.co/onnx-community/embeddinggemma-2-ONNX/resolve/daa72c51243991dfcaf9f9137d2c573d8f7790c0/onnx/vision_encoder_q4.onnx_data'
+  'embeddinggemma-2__onnx__audio_encoder_quantized.onnx::https://huggingface.co/onnx-community/embeddinggemma-2-ONNX/resolve/daa72c51243991dfcaf9f9137d2c573d8f7790c0/onnx/audio_encoder_quantized.onnx'
+  'embeddinggemma-2__onnx__audio_encoder_quantized.onnx_data::https://huggingface.co/onnx-community/embeddinggemma-2-ONNX/resolve/daa72c51243991dfcaf9f9137d2c573d8f7790c0/onnx/audio_encoder_quantized.onnx_data'
+  'whisper__ggml-base-q5_1.bin::https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base-q5_1.bin'
+  'whisper__ggml-silero-v6.2.0.bin::https://huggingface.co/ggml-org/whisper-vad/resolve/9ffd54a1e1ee413ddf265af9913beaf518d1639b/ggml-silero-v6.2.0.bin'
 )
 sha256sums=(
   'SKIP'
@@ -57,6 +65,10 @@ sha256sums=(
   'c3975f2d1ab7a1878ae31a7d7a9b7804a827aff3800b60dfceafce21cac3df49'
   '7ea284226d4938f0ad921ab091f1d80a9ca699aa802984ef5cd5eec4f4761d96'
   '0a9d6c927334f152a33dd90874f65d6ea5228999abe6a450d3f7813677fa704c'
+  '04a9a9094ba76fb169e4c69be45a4b621580188654d6be59eab860eadcd42d3c'
+  'aa6361d898e1f1d6303f8dd2b5fabf4fd3629e15fd709e9cb06ac5cb9416a030'
+  '422f1ae452ade6f30a004d7e5c6a43195e4433bc370bf23fac9cc591f01a8898'
+  '2aa269b785eeb53a82983a20501ddf7c1d9c48e33ab63a41391ac6c9f7fb6987'
 )
 
 pkgver() {
@@ -85,7 +97,11 @@ check() {
 
 package_omafind-git() {
   depends=(gcc-libs glibc libheif poppler)
-  optdepends=('omafind-models: models preinstalled (otherwise run `omafind models fetch`)')
+  optdepends=('omafind-models: models preinstalled (otherwise run `omafind models fetch`)'
+              'tesseract: read text in screenshots, photos of documents and scanned PDFs'
+              'tesseract-data-eng: English for tesseract (add your own languages too)'
+              'ffmpeg: search audio and video by content'
+              'whisper-cpp: search the speech in recordings and videos')
   provides=(omafind)
   conflicts=(omafind)
   cd omafind
@@ -97,7 +113,7 @@ package_omafind-git() {
 }
 
 package_omafind-models() {
-  pkgdesc='Models for omafind: EmbeddingGemma 2 (q4 ONNX, text and vision) and Model2Vec static models'
+  pkgdesc='Models for omafind: EmbeddingGemma 2 (q4 ONNX, text, vision and audio), Model2Vec static models and Whisper base'
   arch=(any)
   license=(Apache-2.0 MIT)
   local m

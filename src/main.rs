@@ -105,7 +105,8 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum ModelsCmd {
-    /// Download the static models and EmbeddingGemma 2 into ~/.local/share/omafind/models.
+    /// Download the static models, EmbeddingGemma 2 and the speech model into
+    /// ~/.local/share/omafind/models.
     Fetch {
         /// Gemma precisions to fetch: q4, int8, fp32 (default: what models.precision resolves to).
         #[arg(long, value_delimiter = ',')]
@@ -113,6 +114,12 @@ enum ModelsCmd {
         /// Skip the code-specific static model.
         #[arg(long)]
         no_code: bool,
+        /// Skip Gemma's audio encoder.
+        #[arg(long)]
+        no_audio: bool,
+        /// Skip the speech-to-text model.
+        #[arg(long)]
+        no_speech: bool,
     },
     /// Show where each model was found.
     List,
@@ -157,19 +164,31 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Index { no_images } => index(&cfg, no_images),
         Cmd::Daemon => daemon::run(cfg),
         Cmd::Status { json } => status(&cfg, json),
-        Cmd::Models { cmd: ModelsCmd::Fetch { precision, no_code } } => {
+        Cmd::Models { cmd: ModelsCmd::Fetch { precision, no_code, no_audio, no_speech } } => {
             let precisions = if precision.is_empty() {
                 vec![omafind::embed::gemma::resolve_precision(&cfg.models)]
             } else {
                 precision
             };
-            models::fetch(&precisions, !no_code && cfg.models.static_code_model)
+            let speech = !no_speech && cfg.indexing.speech;
+            models::fetch(
+                &precisions,
+                &models::FetchOpts {
+                    code: !no_code && cfg.models.static_code_model,
+                    audio: !no_audio && cfg.indexing.audio,
+                    speech: speech.then(|| cfg.indexing.speech_model.clone()),
+                },
+            )?;
+            if speech && !omafind::extract::speech::available() {
+                eprintln!("Transcripts need whisper-cli: install whisper.cpp (Arch: pacman -S whisper-cpp).");
+            }
+            Ok(())
         }
         Cmd::Models { cmd: ModelsCmd::List } => {
             for (name, path) in models::describe() {
                 match path {
-                    Some(p) => println!("{name:<28} {}", p.display()),
-                    None => println!("{name:<28} missing (run `omafind models fetch`)"),
+                    Some(p) => println!("{name:<36} {}", p.display()),
+                    None => println!("{name:<36} missing (run `omafind models fetch`)"),
                 }
             }
             Ok(())
@@ -311,32 +330,51 @@ fn index(cfg: &Config, no_images: bool) -> Result<()> {
         s.removed,
         s.errors
     );
-    if no_images || !cfg.indexing.images {
-        return Ok(());
-    }
-    let total = indexer.pending_images()?;
-    if total == 0 {
+    if no_images {
         return Ok(());
     }
     power::lower_current_thread_priority();
-    println!("Embedding {total} images (newest first; Ctrl-C is safe, the daemon resumes later)...");
+    let pending = indexer.pending()?;
+    if pending.any() {
+        println!("Slower work runs newest first; Ctrl-C is safe, the daemon resumes later.");
+    }
+    let stop = || false;
+    run_lane(&mut indexer, pending.images, "images embedded", |ix| ix.vision_pass(8, &stop))?;
+    run_lane(&mut indexer, pending.media, "recordings and videos embedded", |ix| ix.media_pass(1, &stop))?;
+    // Camera photos wait for their image vector before OCR, so this comes after the images.
+    let ocr = indexer.pending()?.ocr;
+    run_lane(&mut indexer, ocr, "images and scans read (OCR)", |ix| ix.ocr_pass(4, &stop))?;
+    run_lane(&mut indexer, pending.speech, "recordings transcribed", |ix| ix.speech_pass(&stop))?;
+    let c = index::counts(indexer.conn(), &config::db_path())?;
+    if c.images_failed > 0 {
+        println!("{} images could not be embedded (see `omafind status`).", c.images_failed);
+    }
+    Ok(())
+}
+
+/// Runs one indexing lane to the end with a progress line.
+fn run_lane(
+    indexer: &mut Indexer,
+    total: i64,
+    what: &str,
+    mut pass: impl FnMut(&mut Indexer) -> Result<usize>,
+) -> Result<()> {
+    if total == 0 {
+        return Ok(());
+    }
     let t = std::time::Instant::now();
     let mut done = 0;
     loop {
-        let n = indexer.vision_pass(8, &|| false)?;
+        let n = pass(indexer)?;
         if n == 0 {
             break;
         }
         done += n;
         let rate = done as f64 / t.elapsed().as_secs_f64();
-        eprint!(
-            "\r  {done}/{total}  {rate:.1} images/s  ~{:.0} min left   ",
-            (total as f64 - done as f64) / rate / 60.0
-        );
+        let left = (total as f64 - done as f64).max(0.0) / rate / 60.0;
+        eprint!("\r  {what}: {done}/{total}  ~{left:.0} min left   ");
     }
-    eprintln!();
-    let c = index::counts(indexer.conn(), &config::db_path())?;
-    println!("{} images embedded, {} failed.", c.images_embedded, c.images_failed);
+    eprintln!("\r  {what}: {done} in {}          ", humanize_secs(t.elapsed().as_secs()));
     Ok(())
 }
 
@@ -404,6 +442,20 @@ fn status(cfg: &Config, json: bool) -> Result<()> {
         n("images_pending"),
         n("images_failed")
     );
+    if n("ocr_read") + n("ocr_pending") > 0 {
+        println!("        text in images and scans: {} read, {} pending", n("ocr_read"), n("ocr_pending"));
+    }
+    if n("audio") + n("video") > 0 {
+        println!(
+            "        {} recordings, {} videos: {} embedded, {} pending; {} transcribed, {} pending",
+            n("audio"),
+            n("video"),
+            n("media_embedded"),
+            n("media_pending"),
+            n("transcribed"),
+            n("speech_pending")
+        );
+    }
     Ok(())
 }
 

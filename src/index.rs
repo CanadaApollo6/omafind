@@ -2,8 +2,10 @@
 //!
 //! Every file gets a row (name, kind, size, dates) so file-name search covers the whole
 //! disk. Documents and code are read, chunked and embedded with the static models in the
-//! same pass. Images are queued for the vision encoder, which runs in a separate, slower
-//! lane that respects the power budget and processes the newest photos first.
+//! same pass, and so are the tags of recordings. The expensive work runs in slower lanes
+//! that respect the power budget, newest files first: the vision encoder for images, OCR
+//! for screenshots, photographed documents and scanned PDFs, the audio encoder and frame
+//! sampling for recordings and videos, and speech recognition.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
@@ -19,14 +21,29 @@ use serde::Serialize;
 
 use crate::chunk::{Chunk, chunk_text};
 use crate::config::{self, Config};
-use crate::db::{self, TEXT_DONE, TEXT_FAILED, TEXT_NONE, VISION_DONE, VISION_FAILED, VISION_NA, VISION_PENDING};
+use crate::db::{
+    self, EXTRA_DONE, EXTRA_FAILED, EXTRA_NA, EXTRA_PENDING, EXTRA_SKIPPED, SOURCE_OCR, SOURCE_SPEECH, SOURCE_TAGS,
+    TEXT_DONE, TEXT_FAILED, TEXT_NONE, VISION_DONE, VISION_FAILED, VISION_NA, VISION_PENDING,
+};
 use crate::embed::GemmaSlot;
 use crate::embed::gemma::document_input;
 use crate::embed::static_model::{Space, StaticEmbedder};
-use crate::extract::{self, Kind};
+use crate::extract::media::{self, MediaInfo};
+use crate::extract::speech::{self, Whisper};
+use crate::extract::{self, Kind, ocr, pdf};
 use crate::power::{self, Budget};
 
 const BATCH: usize = 64;
+/// Scanned PDF pages read per file.
+const OCR_MAX_PAGES: usize = 50;
+const OCR_DPI: u32 = 300;
+/// Camera photos are read only if Gemma finds them at least this text-like (see `text_likeness`).
+const PHOTO_TEXT_MIN: f32 = -0.025;
+/// Recordings: up to this many audio windows spread over the file.
+const AUDIO_WINDOWS: usize = 4;
+/// Videos: frames sampled across the file (about one per second for short clips).
+const VIDEO_FRAMES_CPU: usize = 16;
+const VIDEO_FRAMES_GPU: usize = 32;
 
 /// Live counters, shared with the status endpoint.
 #[derive(Default)]
@@ -38,6 +55,9 @@ pub struct Stats {
     pub errors: AtomicU64,
     pub images_done: AtomicU64,
     pub gemma_chunks_done: AtomicU64,
+    pub ocr_done: AtomicU64,
+    pub media_done: AtomicU64,
+    pub speech_done: AtomicU64,
     pub scanning: AtomicBool,
 }
 
@@ -50,6 +70,9 @@ pub struct StatsSnapshot {
     pub errors: u64,
     pub images_done: u64,
     pub gemma_chunks_done: u64,
+    pub ocr_done: u64,
+    pub media_done: u64,
+    pub speech_done: u64,
     pub scanning: bool,
 }
 
@@ -63,6 +86,9 @@ impl Stats {
             errors: self.errors.load(Ordering::Relaxed),
             images_done: self.images_done.load(Ordering::Relaxed),
             gemma_chunks_done: self.gemma_chunks_done.load(Ordering::Relaxed),
+            ocr_done: self.ocr_done.load(Ordering::Relaxed),
+            media_done: self.media_done.load(Ordering::Relaxed),
+            speech_done: self.speech_done.load(Ordering::Relaxed),
             scanning: self.scanning.load(Ordering::Relaxed),
         }
     }
@@ -183,9 +209,17 @@ enum Content {
         chunks: Vec<Chunk>,
         vecs: Vec<Vec<f32>>,
         space: Space,
+        /// A PDF with pages that have no text layer.
+        needs_ocr: bool,
     },
     Image {
         taken: Option<i64>,
+    },
+    /// Audio or video. Without ffprobe the details are filled in by `media_pass`.
+    Media {
+        info: Option<MediaInfo>,
+        /// The tags, as one chunk.
+        tags: Option<(Chunk, Vec<f32>)>,
     },
     Failed(String),
 }
@@ -205,6 +239,8 @@ pub struct Indexer {
     pub filter: Filter,
     pub stats: Arc<Stats>,
     pool: rayon::ThreadPool,
+    /// Gemma query vectors for "has text" and "has no text", for deciding which photos to OCR.
+    text_prompts: Option<(Vec<f32>, Vec<Vec<f32>>)>,
 }
 
 impl Indexer {
@@ -229,7 +265,7 @@ impl Indexer {
             .thread_name(|i| format!("omafind-index-{i}"))
             .start_handler(|_| power::lower_current_thread_priority())
             .build()?;
-        Ok(Self { cfg: cfg.clone(), conn, statics, gemma, filter: Filter::new(cfg)?, stats, pool })
+        Ok(Self { cfg: cfg.clone(), conn, statics, gemma, filter: Filter::new(cfg)?, stats, pool, text_prompts: None })
     }
 
     pub fn conn(&self) -> &Connection {
@@ -528,6 +564,269 @@ impl Indexer {
         Ok(n)
     }
 
+    /// Reads text in up to `limit` images and scanned PDFs. Returns how many it handled.
+    /// Camera photos wait for their Gemma vector, which decides whether they're worth reading.
+    pub fn ocr_pass(&mut self, limit: usize, stop: &dyn Fn() -> bool) -> Result<usize> {
+        if !self.ready().ocr {
+            return Ok(0);
+        }
+        let pending: Vec<(i64, String, String, i64)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, path, kind, vision_state FROM files WHERE ocr_state=?1 AND NOT (kind='image' AND vision_state=?2)
+                 ORDER BY COALESCE(taken, mtime) DESC LIMIT ?3",
+            )?;
+            let waiting = if self.cfg.indexing.images { VISION_PENDING } else { -1 };
+            stmt.query_map(params![EXTRA_PENDING, waiting, limit as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<Result<_, _>>()?
+        };
+        let langs = ocr::languages(&self.cfg.indexing.ocr_languages);
+        let mut n = 0;
+        for (id, path, kind, vision_state) in pending {
+            if stop() {
+                break;
+            }
+            let p = PathBuf::from(&path);
+            let result =
+                if kind == "image" { self.ocr_image(id, &p, vision_state, &langs) } else { ocr_pdf(&p, &langs, stop) };
+            let tx = self.conn.unchecked_transaction()?;
+            match result {
+                Ok(Some(pages)) if !pages.is_empty() => {
+                    let mut chunks = Vec::new();
+                    for (page, text) in &pages {
+                        for c in crate::chunk::chunk_text(text) {
+                            chunks.push(NewChunk { chunk: c, source: SOURCE_OCR, page: *page, start_ms: None });
+                        }
+                    }
+                    append_chunks(&tx, id, &file_name(&p), Space::Text, &chunks, &self.statics)?;
+                    tx.execute("UPDATE files SET ocr_state=?2 WHERE id=?1", params![id, EXTRA_DONE])?;
+                    self.stats.ocr_done.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(Some(_)) => {
+                    tx.execute("UPDATE files SET ocr_state=?2 WHERE id=?1", params![id, EXTRA_SKIPPED])?;
+                }
+                // Stopped half-way through a PDF: try again later.
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::debug!("OCR failed for {path}: {e:#}");
+                    tx.execute(
+                        "UPDATE files SET ocr_state=?2, error=?3 WHERE id=?1",
+                        params![id, EXTRA_FAILED, format!("OCR: {e:#}")],
+                    )?;
+                    self.stats.errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            tx.commit()?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// OCR for one image. `Some(empty)` means there was no text to read.
+    fn ocr_image(&mut self, id: i64, path: &Path, vision_state: i64, langs: &str) -> Result<Option<Vec<OcrPage>>> {
+        if extract::image::is_camera_photo(path) {
+            // Most photos have no text; reading them all would cost a second or more each.
+            let vec: Option<Vec<u8>> = if vision_state == VISION_DONE {
+                self.conn.query_row("SELECT embedding FROM vec_image WHERE rowid=?1", [id], |r| r.get(0)).optional()?
+            } else {
+                None
+            };
+            let Some(vec) = vec else { return Ok(Some(Vec::new())) };
+            let likeness = self.text_likeness(&db::bytes_f32(&vec))?;
+            if likeness < PHOTO_TEXT_MIN {
+                return Ok(Some(Vec::new()));
+            }
+        }
+        let img = extract::image::load(path, self.cfg.max_image_bytes)?;
+        let text = ocr::recognize(ocr::prepare_image(&img)?, langs)?;
+        Ok(Some(text.map(|t| vec![(None, t)]).unwrap_or_default()))
+    }
+
+    /// How much more an image vector looks like a page, sign or screen full of text than like a
+    /// photo without writing (Gemma similarities; text-heavy images score above zero).
+    fn text_likeness(&mut self, v: &[f32]) -> Result<f32> {
+        if self.text_prompts.as_ref().is_none_or(|p| p.0.len() != v.len()) {
+            let gemma = self.gemma.get()?;
+            let q = |t: &str| gemma.embed_query(t, crate::embed::gemma::QUERY_PREFIX);
+            let has = q("a document, receipt, screenshot or sign with readable text")?;
+            let hasnt = vec![q("a photo without any writing")?, q("a photo of people, animals or scenery")?];
+            self.text_prompts = Some((has, hasnt));
+        }
+        let (has, hasnt) = self.text_prompts.as_ref().unwrap();
+        let dot = crate::embed::gemma::dot;
+        let neg = hasnt.iter().map(|n| dot(n, v)).fold(f32::MIN, f32::max);
+        Ok(dot(has, v) - neg)
+    }
+
+    /// Embeds up to `limit` recordings and videos with Gemma. Returns how many it handled.
+    pub fn media_pass(&mut self, limit: usize, stop: &dyn Fn() -> bool) -> Result<usize> {
+        let ready = self.ready();
+        if !(ready.audio || ready.video) {
+            return Ok(0);
+        }
+        let pending: Vec<(i64, String, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, path, kind FROM files WHERE media_state=?1 AND ((kind='video' AND ?2) OR (kind='audio' AND ?3))
+                 ORDER BY COALESCE(taken, mtime) DESC LIMIT ?4",
+            )?;
+            stmt.query_map(params![EXTRA_PENDING, ready.video, ready.audio, limit as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<Result<_, _>>()?
+        };
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        let gemma = self.gemma.get()?;
+        let mut n = 0;
+        for (id, path, kind) in pending {
+            if stop() {
+                break;
+            }
+            let p = PathBuf::from(&path);
+            let result = (|| -> Result<(MediaInfo, Vec<Segment>, Option<String>)> {
+                let info = media::probe(&p)?;
+                let duration = info.duration.unwrap_or(0.0);
+                let mut segments = Vec::new();
+                let mut thumb_img = None;
+                if kind == "video" && info.has_video {
+                    let want = if gemma.on_gpu() { VIDEO_FRAMES_GPU } else { VIDEO_FRAMES_CPU };
+                    let count = (duration.floor() as usize).clamp(1, want);
+                    let mut frames = Vec::new();
+                    for t in media::spread(duration.max(0.1), count) {
+                        // Unreadable frames (a damaged stretch) are skipped, not fatal.
+                        if let Ok(f) = media::frame(&p, t, 768) {
+                            frames.push(f);
+                        }
+                    }
+                    anyhow::ensure!(!frames.is_empty(), "no readable frames");
+                    segments.push((0, (duration * 1000.0) as i64, gemma.embed_video(&frames)?));
+                    thumb_img = Some(frames.swap_remove(frames.len() / 2));
+                } else if kind == "audio" && info.has_audio && gemma.has_audio() {
+                    let window = crate::embed::gemma::AUDIO_WINDOW_SECS;
+                    let starts: Vec<f64> = if duration <= window {
+                        vec![0.0]
+                    } else {
+                        let count = ((duration / 60.0).ceil() as usize).clamp(1, AUDIO_WINDOWS);
+                        media::spread(duration, count).into_iter().map(|c| (c - window / 2.0).max(0.0)).collect()
+                    };
+                    for start in starts {
+                        let samples = media::decode_audio(&p, start, window)?;
+                        if samples.len() < media::SAMPLE_RATE as usize / 2 {
+                            continue;
+                        }
+                        let end = start + samples.len() as f64 / media::SAMPLE_RATE as f64;
+                        segments.push(((start * 1000.0) as i64, (end * 1000.0) as i64, gemma.embed_audio(&samples)?));
+                    }
+                    if info.has_cover {
+                        thumb_img = media::cover(&p).ok();
+                    }
+                }
+                let thumb = match thumb_img {
+                    Some(img) if self.cfg.indexing.thumbnails => {
+                        let dest = thumb_path(&path);
+                        extract::image::write_thumbnail(&img, &dest).ok().map(|_| dest.to_string_lossy().into_owned())
+                    }
+                    _ => None,
+                };
+                Ok((info, segments, thumb))
+            })();
+            let tx = self.conn.unchecked_transaction()?;
+            match result {
+                Ok((info, segments, thumb)) => {
+                    db::clear_media(&tx, id)?;
+                    for (start, end, v) in &segments {
+                        tx.execute(
+                            "INSERT INTO media_segments(file_id, start_ms, end_ms) VALUES (?1, ?2, ?3)",
+                            params![id, start, end],
+                        )?;
+                        tx.execute(
+                            "INSERT INTO vec_media(rowid, embedding) VALUES (?1, ?2)",
+                            params![tx.last_insert_rowid(), db::f32_bytes(v)],
+                        )?;
+                    }
+                    let state = if segments.is_empty() { EXTRA_SKIPPED } else { EXTRA_DONE };
+                    tx.execute(
+                        "UPDATE files SET media_state=?2, duration=?3, meta=?4, thumb=COALESCE(?5, thumb),
+                             taken=COALESCE(taken, ?6) WHERE id=?1",
+                        params![id, state, info.duration, serde_json::to_string(&info)?, thumb, info.created],
+                    )?;
+                    self.stats.media_done.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    tracing::debug!("media embedding failed for {path}: {e:#}");
+                    tx.execute(
+                        "UPDATE files SET media_state=?2, error=?3 WHERE id=?1",
+                        params![id, EXTRA_FAILED, format!("{e:#}")],
+                    )?;
+                    self.stats.errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            tx.commit()?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// Transcribes one recording or video. Returns how many files it handled (0 or 1): one
+    /// transcript can take minutes, so the caller checks for other work in between.
+    pub fn speech_pass(&mut self, stop: &dyn Fn() -> bool) -> Result<usize> {
+        if !self.ready().speech {
+            return Ok(0);
+        }
+        let Some((model, vad)) = crate::models::find_whisper(&self.cfg.indexing.speech_model) else { return Ok(0) };
+        let next: Option<(i64, String)> = self
+            .conn
+            .query_row(
+                "SELECT id, path FROM files WHERE speech_state=?1 ORDER BY COALESCE(taken, mtime) DESC LIMIT 1",
+                [EXTRA_PENDING],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((id, path)) = next else { return Ok(0) };
+        let p = PathBuf::from(&path);
+        let whisper = Whisper { model: &model, vad: vad.as_deref(), threads: crate::embed::gemma::threads(&self.cfg) };
+        let max_secs = self.cfg.indexing.speech_max_minutes as f64 * 60.0;
+        let result = media::probe(&p).and_then(|info| {
+            if !info.has_audio || (info.is_music() && !info.has_video) {
+                return Ok(Some(None));
+            }
+            Ok(whisper.transcribe(&p, info.duration.unwrap_or(max_secs), max_secs, stop)?.map(Some))
+        });
+        let tx = self.conn.unchecked_transaction()?;
+        match result {
+            Ok(None) => return Ok(0),
+            Ok(Some(transcript)) => {
+                let segments = transcript.as_ref().map(|t| t.segments.as_slice()).unwrap_or_default();
+                let chunks: Vec<NewChunk> = speech::chunks(segments)
+                    .into_iter()
+                    .map(|(chunk, start)| NewChunk { chunk, source: SOURCE_SPEECH, page: None, start_ms: Some(start) })
+                    .collect();
+                append_chunks(&tx, id, &file_name(&p), Space::Text, &chunks, &self.statics)?;
+                let state = if chunks.is_empty() { EXTRA_SKIPPED } else { EXTRA_DONE };
+                tx.execute("UPDATE files SET speech_state=?2 WHERE id=?1", params![id, state])?;
+                if let Some(lang) = transcript.and_then(|t| t.language).filter(|_| !chunks.is_empty()) {
+                    tx.execute(
+                        "UPDATE files SET meta=json_set(COALESCE(meta, '{}'), '$.language', ?2) WHERE id=?1",
+                        params![id, lang],
+                    )?;
+                }
+                self.stats.speech_done.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                tracing::debug!("transcription failed for {path}: {e:#}");
+                tx.execute(
+                    "UPDATE files SET speech_state=?2, error=?3 WHERE id=?1",
+                    params![id, EXTRA_FAILED, format!("speech: {e:#}")],
+                )?;
+                self.stats.errors.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        tx.commit()?;
+        Ok(1)
+    }
+
     /// Pre-computes Gemma vectors for text chunks (only with `indexing.gemma_text`).
     pub fn gemma_text_pass(&mut self, limit: usize) -> Result<usize> {
         if !self.cfg.indexing.gemma_text {
@@ -562,6 +861,62 @@ impl Indexer {
     pub fn pending_images(&self) -> Result<i64> {
         Ok(self.conn.query_row("SELECT count(*) FROM files WHERE vision_state=?1", [VISION_PENDING], |r| r.get(0))?)
     }
+
+    /// Which of the slower lanes can run: enabled, with their tools installed and models fetched.
+    /// Files wait (pending) for lanes that can't, so installing the tool later picks them up.
+    pub fn ready(&self) -> Ready {
+        let ix = &self.cfg.indexing;
+        let ffmpeg = media::available();
+        Ready {
+            ocr: ix.ocr && ocr::available(),
+            video: ix.video && ffmpeg,
+            audio: ix.audio
+                && ffmpeg
+                && crate::models::find_gemma_audio(&crate::embed::gemma::resolve_precision(&self.cfg.models)).is_some(),
+            speech: ix.speech
+                && ffmpeg
+                && speech::available()
+                && crate::models::find_whisper(&ix.speech_model).is_some(),
+        }
+    }
+
+    /// Files waiting for a lane that can run now, per lane.
+    pub fn pending(&self) -> Result<Pending> {
+        let ready = self.ready();
+        let q = |sql: &str| -> Result<i64> { Ok(self.conn.query_row(sql, [], |r| r.get(0))?) };
+        let p = EXTRA_PENDING;
+        Ok(Pending {
+            images: if self.cfg.indexing.images { self.pending_images()? } else { 0 },
+            ocr: if ready.ocr { q(&format!("SELECT count(*) FROM files WHERE ocr_state={p}"))? } else { 0 },
+            media: q(&format!(
+                "SELECT count(*) FROM files WHERE media_state={p} AND ((kind='video' AND {}) OR (kind='audio' AND {}))",
+                ready.video, ready.audio
+            ))?,
+            speech: if ready.speech { q(&format!("SELECT count(*) FROM files WHERE speech_state={p}"))? } else { 0 },
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Ready {
+    pub ocr: bool,
+    pub video: bool,
+    pub audio: bool,
+    pub speech: bool,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct Pending {
+    pub images: i64,
+    pub ocr: i64,
+    pub media: i64,
+    pub speech: i64,
+}
+
+impl Pending {
+    pub fn any(&self) -> bool {
+        self.images + self.ocr + self.media + self.speech > 0
+    }
 }
 
 fn prepare(job: Job, cfg: &Config, statics: &StaticEmbedder) -> Prepared {
@@ -581,9 +936,26 @@ fn prepare(job: Job, cfg: &Config, statics: &StaticEmbedder) -> Prepared {
             Err(e) => Content::Failed(format!("{e:#}")),
         },
         Kind::Image => Content::Image { taken: extract::image::taken(&job.path) },
+        Kind::Audio | Kind::Video => media_content(&job.path, statics),
         _ => Content::Bare,
     };
     Prepared { job, kind, fingerprint, content }
+}
+
+/// Details and tags of a recording or video. The embedding and transcript come later.
+fn media_content(path: &Path, statics: &StaticEmbedder) -> Content {
+    if !media::available() {
+        return Content::Media { info: None, tags: None };
+    }
+    let info = match media::probe(path) {
+        Ok(info) => info,
+        Err(e) => return Content::Failed(format!("{e:#}")),
+    };
+    let tags = info.tags_text().map(|text| {
+        let v = statics.embed(Space::Text, &[format!("{}\n{text}", file_name(path))]).remove(0);
+        (Chunk { line: 0, text }, v)
+    });
+    Content::Media { info: Some(info), tags }
 }
 
 fn text_content(path: &Path, kind: Kind, cfg: &Config, statics: &StaticEmbedder) -> Result<Content> {
@@ -601,23 +973,49 @@ fn text_content(path: &Path, kind: Kind, cfg: &Config, statics: &StaticEmbedder)
     // Static models see the file name too: it often carries the topic.
     let inputs: Vec<String> = chunks.iter().map(|c| format!("{name}\n{}", c.text)).collect();
     let vecs = statics.embed(space, &inputs);
-    Ok(Content::Text { chunks, vecs, space })
+    Ok(Content::Text { chunks, vecs, space, needs_ocr: extracted.needs_ocr })
 }
 
 fn write_prepared(tx: &Connection, p: &Prepared) -> Result<()> {
     let path = p.job.path.to_string_lossy();
-    let (text_state, vision_state, taken, error) = match &p.content {
-        Content::Bare => (TEXT_NONE, VISION_NA, None, None),
-        Content::Text { .. } => (TEXT_DONE, VISION_NA, None, None),
-        Content::Image { taken } => (TEXT_NONE, VISION_PENDING, *taken, None),
-        Content::Failed(e) => (TEXT_FAILED, VISION_NA, None, Some(e.as_str())),
-    };
+    let mut row = Row::default();
+    match &p.content {
+        Content::Bare => {}
+        Content::Text { needs_ocr, .. } => {
+            row.text_state = TEXT_DONE;
+            row.ocr_state = if *needs_ocr { EXTRA_PENDING } else { EXTRA_NA };
+        }
+        Content::Image { taken } => {
+            row.vision_state = VISION_PENDING;
+            row.ocr_state = EXTRA_PENDING;
+            row.taken = *taken;
+        }
+        Content::Media { info, .. } => {
+            row.media_state = EXTRA_PENDING;
+            row.speech_state = EXTRA_PENDING;
+            if let Some(info) = info {
+                row.taken = info.created;
+                row.duration = info.duration;
+                row.meta = Some(serde_json::to_string(info)?);
+                if !info.has_audio || (info.is_music() && !info.has_video) {
+                    row.speech_state = EXTRA_NA;
+                }
+            }
+        }
+        Content::Failed(e) => {
+            row.text_state = TEXT_FAILED;
+            row.error = Some(e.as_str());
+        }
+    }
     let id: i64 = tx.query_row(
-        "INSERT INTO files(path, name, ext, kind, size, mtime, taken, fingerprint, text_state, vision_state, error, indexed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        "INSERT INTO files(path, name, ext, kind, size, mtime, taken, fingerprint, text_state, vision_state, error,
+             indexed_at, ocr_state, media_state, speech_state, duration, meta)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
          ON CONFLICT(path) DO UPDATE SET kind=excluded.kind, size=excluded.size, mtime=excluded.mtime,
              taken=excluded.taken, fingerprint=excluded.fingerprint, text_state=excluded.text_state,
-             vision_state=excluded.vision_state, error=excluded.error, indexed_at=excluded.indexed_at
+             vision_state=excluded.vision_state, error=excluded.error, indexed_at=excluded.indexed_at,
+             ocr_state=excluded.ocr_state, media_state=excluded.media_state, speech_state=excluded.speech_state,
+             duration=excluded.duration, meta=excluded.meta
          RETURNING id",
         params![
             path,
@@ -626,27 +1024,139 @@ fn write_prepared(tx: &Connection, p: &Prepared) -> Result<()> {
             p.kind.as_str(),
             p.job.size as i64,
             p.job.mtime,
-            taken,
+            row.taken,
             p.fingerprint,
-            text_state,
-            vision_state,
-            error,
-            db::now_secs()
+            row.text_state,
+            row.vision_state,
+            row.error,
+            db::now_secs(),
+            row.ocr_state,
+            row.media_state,
+            row.speech_state,
+            row.duration,
+            row.meta,
         ],
         |r| r.get(0),
     )?;
     if p.job.existing.is_some() {
         db::clear_file_content(tx, id)?;
     }
-    if let Content::Text { chunks, vecs, space } = &p.content {
-        let mut ins_chunk =
-            tx.prepare_cached("INSERT INTO chunks(file_id, ord, line, text) VALUES (?1, ?2, ?3, ?4)")?;
-        for (i, (c, v)) in chunks.iter().zip(vecs).enumerate() {
-            ins_chunk.execute(params![id, i as i64, c.line as i64, c.text])?;
-            crate::vecindex::insert(tx, tx.last_insert_rowid(), id, *space, v)?;
+    match &p.content {
+        Content::Text { chunks, vecs, space, .. } => {
+            let mut ins_chunk =
+                tx.prepare_cached("INSERT INTO chunks(file_id, ord, line, text) VALUES (?1, ?2, ?3, ?4)")?;
+            for (i, (c, v)) in chunks.iter().zip(vecs).enumerate() {
+                ins_chunk.execute(params![id, i as i64, c.line as i64, c.text])?;
+                crate::vecindex::insert(tx, tx.last_insert_rowid(), id, *space, v)?;
+            }
         }
+        Content::Media { tags: Some((c, v)), .. } => {
+            tx.execute(
+                "INSERT INTO chunks(file_id, ord, line, text, source) VALUES (?1, 0, 0, ?2, ?3)",
+                params![id, c.text, SOURCE_TAGS],
+            )?;
+            crate::vecindex::insert(tx, tx.last_insert_rowid(), id, Space::Text, v)?;
+        }
+        _ => {}
     }
     Ok(())
+}
+
+/// Column values of a `files` row that depend on the content.
+struct Row<'a> {
+    text_state: i64,
+    vision_state: i64,
+    ocr_state: i64,
+    media_state: i64,
+    speech_state: i64,
+    taken: Option<i64>,
+    duration: Option<f64>,
+    meta: Option<String>,
+    error: Option<&'a str>,
+}
+
+impl Default for Row<'_> {
+    fn default() -> Self {
+        Self {
+            text_state: TEXT_NONE,
+            vision_state: VISION_NA,
+            ocr_state: EXTRA_NA,
+            media_state: EXTRA_NA,
+            speech_state: EXTRA_NA,
+            taken: None,
+            duration: None,
+            meta: None,
+            error: None,
+        }
+    }
+}
+
+/// Start and end (ms) of a stretch of a recording, and its Gemma vector.
+type Segment = (i64, i64, Vec<f32>);
+
+/// Text read from a page (PDF page number, when there are pages).
+type OcrPage = (Option<i64>, String);
+
+/// A chunk found after the file was indexed: OCR or a transcript.
+struct NewChunk {
+    chunk: Chunk,
+    source: i64,
+    page: Option<i64>,
+    start_ms: Option<i64>,
+}
+
+/// Adds chunks to a file that already has some, with static vectors. Earlier chunks of the
+/// same source are replaced, so a pass that runs twice doesn't duplicate them.
+fn append_chunks(
+    tx: &Connection,
+    file_id: i64,
+    name: &str,
+    space: Space,
+    chunks: &[NewChunk],
+    statics: &StaticEmbedder,
+) -> Result<()> {
+    for source in chunks.iter().map(|c| c.source).collect::<HashSet<_>>() {
+        // Vectors and Gemma caches go with the chunk (ON DELETE CASCADE).
+        tx.execute("DELETE FROM chunks WHERE file_id=?1 AND source=?2", params![file_id, source])?;
+    }
+    let first: i64 =
+        tx.query_row("SELECT COALESCE(max(ord) + 1, 0) FROM chunks WHERE file_id=?1", [file_id], |r| r.get(0))?;
+    let inputs: Vec<String> = chunks.iter().map(|c| format!("{name}\n{}", c.chunk.text)).collect();
+    let vecs = statics.embed(space, &inputs);
+    let mut ins = tx.prepare_cached(
+        "INSERT INTO chunks(file_id, ord, line, text, source, page, start_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?;
+    for (i, (c, v)) in chunks.iter().zip(vecs).enumerate() {
+        ins.execute(params![
+            file_id,
+            first + i as i64,
+            c.chunk.line as i64,
+            c.chunk.text,
+            c.source,
+            c.page,
+            c.start_ms
+        ])?;
+        crate::vecindex::insert(tx, tx.last_insert_rowid(), file_id, space, &v)?;
+    }
+    Ok(())
+}
+
+/// Reads the pages of a PDF that have no text layer, up to `OCR_MAX_PAGES`. `None` if `stop`
+/// interrupted it.
+fn ocr_pdf(path: &Path, langs: &str, stop: &dyn Fn() -> bool) -> Result<Option<Vec<OcrPage>>> {
+    let pages = pdf::pages(path)?;
+    let mut out = Vec::new();
+    for page in pdf::pages_without_text(&pages).into_iter().take(OCR_MAX_PAGES) {
+        if stop() {
+            return Ok(None);
+        }
+        let png = pdf::render_page(path, page, OCR_DPI)?;
+        let img = image::load_from_memory(&png)?;
+        if let Some(text) = ocr::recognize(ocr::prepare_image(&img)?, langs)? {
+            out.push((Some(page as i64), text));
+        }
+    }
+    Ok(Some(out))
 }
 
 pub fn file_name(p: &Path) -> String {
@@ -695,6 +1205,14 @@ pub struct IndexCounts {
     pub chunks: i64,
     pub gemma_chunks: i64,
     pub text_failed: i64,
+    pub audio: i64,
+    pub video: i64,
+    pub media_embedded: i64,
+    pub media_pending: i64,
+    pub transcribed: i64,
+    pub speech_pending: i64,
+    pub ocr_read: i64,
+    pub ocr_pending: i64,
     pub db_bytes: u64,
 }
 
@@ -711,6 +1229,14 @@ pub fn counts(conn: &Connection, db_path: &Path) -> Result<IndexCounts> {
         chunks: q("SELECT count(*) FROM chunks")?,
         gemma_chunks: q("SELECT count(*) FROM gemma_chunks")?,
         text_failed: q(&format!("SELECT count(*) FROM files WHERE text_state={TEXT_FAILED}"))?,
+        audio: q("SELECT count(*) FROM files WHERE kind='audio'")?,
+        video: q("SELECT count(*) FROM files WHERE kind='video'")?,
+        media_embedded: q(&format!("SELECT count(*) FROM files WHERE media_state={EXTRA_DONE}"))?,
+        media_pending: q(&format!("SELECT count(*) FROM files WHERE media_state={EXTRA_PENDING}"))?,
+        transcribed: q(&format!("SELECT count(*) FROM files WHERE speech_state={EXTRA_DONE}"))?,
+        speech_pending: q(&format!("SELECT count(*) FROM files WHERE speech_state={EXTRA_PENDING}"))?,
+        ocr_read: q(&format!("SELECT count(*) FROM files WHERE ocr_state={EXTRA_DONE}"))?,
+        ocr_pending: q(&format!("SELECT count(*) FROM files WHERE ocr_state={EXTRA_PENDING}"))?,
         db_bytes: ["", "-wal"]
             .iter()
             .filter_map(|s| std::fs::metadata(format!("{}{s}", db_path.display())).ok())

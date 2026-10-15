@@ -153,7 +153,7 @@ Item {
     for (var g = 0; g < groups.length; g++) {
       var group = groups[g]
       displayModel.append({ rowType: "header", title: group.title, kind: group.kind, name: "", dir: "", path: "",
-                            snippet: "", thumb: "", line: 0, why: "", date: 0 })
+                            snippet: "", thumb: "", place: "", why: "", date: 0 })
       for (var i = 0; i < group.hits.length; i++) {
         var h = group.hits[i]
         if (firstHit < 0) firstHit = displayModel.count
@@ -167,8 +167,8 @@ Item {
           path: h.path,
           snippet: h.snippet || "",
           thumb: h.thumb || "",
-          line: h.line || 0,
-          why: (h.why || []).join(", "),
+          place: root.formatPlace(h),
+          why: (h.why || []).map(function(w) { return root.whyLabels[w] || w }).join(", "),
           date: h.date || 0
         })
       }
@@ -259,6 +259,27 @@ Item {
 
   function formatMs(ms) {
     return ms < 1 ? "<1 ms" : Math.round(ms) + " ms"
+  }
+
+  // How the evidence is named in the preview ("matched by text in image, Gemma").
+  readonly property var whyLabels: ({ ocr: "text in image", speech: "transcript", tags: "tags",
+                                      gemma: "Gemma", vision: "picture", audio: "sound" })
+
+  function formatClock(secs) {
+    var s = Math.floor(secs)
+    var h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), r = s % 60
+    var mm = (h > 0 && m < 10 ? "0" : "") + m, ss = (r < 10 ? "0" : "") + r
+    return (h > 0 ? h + ":" : "") + mm + ":" + ss
+  }
+
+  // Where in the file the match is: a line, a PDF page, a moment in a recording; plus length.
+  function formatPlace(h) {
+    var parts = []
+    if (h.line > 1) parts.push("line " + h.line)
+    if (h.page) parts.push("page " + h.page)
+    if (h.at_ms !== undefined && h.at_ms !== null) parts.push("at " + root.formatClock(h.at_ms / 1000))
+    if (h.duration) parts.push(root.formatClock(h.duration) + " long")
+    return parts.join("  ·  ")
   }
 
   function formatDate(secs) {
@@ -643,7 +664,7 @@ Item {
                   textFormat: Text.PlainText
                   width: parent.width
                   text: previewPane.activeRow
-                        ? previewPane.activeRow.dir + (previewPane.activeRow.line > 1 ? "  ·  line " + previewPane.activeRow.line : "")
+                        ? previewPane.activeRow.dir + (previewPane.activeRow.place ? "  ·  " + previewPane.activeRow.place : "")
                         : ""
                   color: root.foreground
                   opacity: root.dimOpacity

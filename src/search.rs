@@ -3,9 +3,10 @@
 //! **Fast** (every keystroke): file names (FTS5 prefix match), exact words (FTS5 BM25 over
 //! chunks) and static-embedding nearest neighbours, fused with reciprocal rank fusion.
 //!
-//! **Deep** (after a pause): EmbeddingGemma embeds the query, searches the image vectors
-//! and re-scores the fast stage's text shortlist. Text-to-text and text-to-image scores
-//! are on different scales, so results stay grouped by kind instead of being merged.
+//! **Deep** (after a pause): EmbeddingGemma embeds the query, searches the image, audio and
+//! video vectors and re-scores the fast stage's text shortlist, which includes text read
+//! from images and scans and transcribed speech. Text-to-text and text-to-image scores are
+//! on different scales, so results stay grouped by kind instead of being merged.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -26,6 +27,8 @@ use crate::vecindex::StaticIndex;
 
 /// (chunk id, file id, chunk text, file name, file kind, cached Gemma vector).
 type ChunkRow = (i64, i64, String, String, String, Option<Vec<u8>>);
+/// (path, name, kind, date, thumbnail, duration).
+type FileRow = (String, String, String, i64, Option<String>, Option<f64>);
 
 const RRF_K: f64 = 60.0;
 const KEYWORD_K: usize = 100;
@@ -39,6 +42,8 @@ const NAME_SUBSTRING_MIN: usize = 3;
 const KEYWORD_BUDGET: i64 = 20_000;
 const TERM_COUNT_MAX_AGE_SECS: u64 = 600;
 const IMAGE_K: usize = 80;
+/// Audio and video segments share one vector table.
+const MEDIA_K: usize = 200;
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Query {
@@ -141,8 +146,18 @@ pub struct Hit {
     pub thumb: Option<String>,
     /// Capture time for photos, otherwise modification time (Unix seconds).
     pub date: i64,
-    /// Which signals matched: name, keyword, semantic, gemma, vision.
+    /// Which signals matched: name, keyword, semantic, gemma, vision, audio; and where the
+    /// matching text came from when it isn't the file's own: ocr, speech, tags.
     pub why: Vec<&'static str>,
+    /// PDF page of matching OCR text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<i64>,
+    /// Where the matching speech starts in a recording (ms).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at_ms: Option<i64>,
+    /// Audio and video length in seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<f64>,
     /// Deep stage: Gemma similarity to the query above its unrelated-content level.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sim: Option<f32>,
@@ -233,12 +248,17 @@ pub struct Engine {
 struct Baseline {
     taken: Instant,
     images: Vec<Vec<f32>>,
+    audio: Vec<Vec<f32>>,
+    video: Vec<Vec<f32>>,
     text: Vec<Vec<f32>>,
     code: Vec<Vec<f32>>,
 }
 
 const BASELINE_SAMPLE: usize = 256;
 const BASELINE_MIN: usize = 16;
+/// Images, recordings and videos: a smaller sample still beats a guess, with a wider margin.
+const BASELINE_SMALL_MIN: usize = 3;
+const BASELINE_SMALL_MARGIN: f64 = 1.5;
 const BASELINE_MAX_AGE_SECS: u64 = 600;
 /// A sample taken while Gemma vectors were still scarce (fresh index) is retaken sooner.
 const BASELINE_PARTIAL_AGE_SECS: u64 = 2;
@@ -255,6 +275,20 @@ impl Baseline {
             for id in rng.sample(&image_ids, BASELINE_SAMPLE) {
                 if let Some(b) = stmt.query_row([id], |r| r.get::<_, Vec<u8>>(0)).optional()? {
                     images.push(db::bytes_f32(&b));
+                }
+            }
+        }
+        let (mut audio, mut video) = (Vec::new(), Vec::new());
+        if let Ok(mut stmt) = conn.prepare("SELECT embedding FROM vec_media WHERE rowid=?1") {
+            for (kind, out) in [("audio", &mut audio), ("video", &mut video)] {
+                let ids: Vec<i64> = conn
+                    .prepare("SELECT s.id FROM media_segments s JOIN files f ON f.id=s.file_id WHERE f.kind=?1")?
+                    .query_map([kind], |r| r.get(0))?
+                    .collect::<Result<_, _>>()?;
+                for id in rng.sample(&ids, BASELINE_SAMPLE) {
+                    if let Some(b) = stmt.query_row([id], |r| r.get::<_, Vec<u8>>(0)).optional()? {
+                        out.push(db::bytes_f32(&b));
+                    }
                 }
             }
         }
@@ -283,15 +317,35 @@ impl Baseline {
                 }
             }
         }
-        Ok(Self { taken: Instant::now(), images, text, code })
+        Ok(Self { taken: Instant::now(), images, audio, video, text, code })
     }
 
     /// Mean similarity of `q` to a sample, if the sample is big enough to mean anything.
     fn level(sample: &[Vec<f32>], q: &[f32]) -> Option<f64> {
-        let usable: Vec<&Vec<f32>> = sample.iter().filter(|v| v.len() == q.len()).collect();
-        (usable.len() >= BASELINE_MIN)
-            .then(|| usable.iter().map(|v| dot(q, v) as f64).sum::<f64>() / usable.len() as f64)
+        Self::level_n(sample, q).filter(|l| l.1 >= BASELINE_MIN).map(|l| l.0)
     }
+
+    /// Typical similarity and sample size, from `BASELINE_SMALL_MIN` vectors up. Small samples
+    /// use the median: in a handful of photos, the three of cats would pull the mean up.
+    fn level_n(sample: &[Vec<f32>], q: &[f32]) -> Option<(f64, usize)> {
+        let mut sims: Vec<f64> = sample.iter().filter(|v| v.len() == q.len()).map(|v| dot(q, v) as f64).collect();
+        let n = sims.len();
+        if n < BASELINE_SMALL_MIN {
+            return None;
+        }
+        if n >= BASELINE_MIN {
+            return Some((sims.iter().sum::<f64>() / n as f64, n));
+        }
+        sims.sort_by(|a, b| a.total_cmp(b));
+        Some((sims[n / 2], n))
+    }
+}
+
+/// Unrelated-similarity levels for images, recordings and videos, with their sample sizes.
+struct MediaLevels {
+    image: Option<(f64, usize)>,
+    audio: Option<(f64, usize)>,
+    video: Option<(f64, usize)>,
 }
 
 /// xorshift64*, enough for sampling.
@@ -377,13 +431,35 @@ impl Engine {
         db::open_readonly(&self.db_path)
     }
 
-    /// Unrelated-similarity levels for a query: (text, code, images).
-    fn baseline_levels(
-        &self,
-        conn: &Connection,
-        qv: &[f32],
-        code_qv: &[f32],
-    ) -> (Option<f64>, Option<f64>, Option<f64>) {
+    /// Unrelated-similarity levels for a query: (text, code).
+    fn baseline_levels(&self, conn: &Connection, qv: &[f32], code_qv: &[f32]) -> (Option<f64>, Option<f64>) {
+        self.with_baseline(conn, |b| {
+            let text = Baseline::level(&b.text, qv);
+            let code = Baseline::level(&b.code, code_qv).or(text);
+            (text.or(code), code)
+        })
+        .unwrap_or((None, None))
+    }
+
+    fn media_levels(&self, conn: &Connection, qv: &[f32]) -> MediaLevels {
+        self.with_baseline(conn, |b| {
+            // Too few of one kind: all images, recordings and videos together stand in. Their
+            // unrelated levels are close (one model, one embedding space).
+            let pooled = || {
+                let all: Vec<Vec<f32>> = b.images.iter().chain(&b.audio).chain(&b.video).cloned().collect();
+                Baseline::level_n(&all, qv).map(|(l, n)| (l, n.min(BASELINE_MIN - 1)))
+            };
+            MediaLevels {
+                image: Baseline::level_n(&b.images, qv).or_else(pooled),
+                audio: Baseline::level_n(&b.audio, qv).or_else(pooled),
+                video: Baseline::level_n(&b.video, qv).or_else(pooled),
+            }
+        })
+        .unwrap_or(MediaLevels { image: None, audio: None, video: None })
+    }
+
+    /// Runs `f` on the baseline sample, taking a new one when it's stale.
+    fn with_baseline<R>(&self, conn: &Connection, f: impl FnOnce(&Baseline) -> R) -> Option<R> {
         let mut guard = self.baseline.lock().unwrap();
         let fresh = guard.as_ref().is_some_and(|b| {
             let partial = b.text.len() < BASELINE_SAMPLE || b.code.len() < BASELINE_SAMPLE;
@@ -396,10 +472,7 @@ impl Engine {
                 Err(e) => tracing::warn!("sampling baseline vectors: {e:#}"),
             }
         }
-        let Some(b) = guard.as_ref() else { return (None, None, None) };
-        let text = Baseline::level(&b.text, qv);
-        let code = Baseline::level(&b.code, code_qv).or(text);
-        (text.or(code), code, Baseline::level(&b.images, qv))
+        guard.as_ref().map(f)
     }
 
     pub fn fast(&self, conn: &Connection, q: &Query, mode: FastMode) -> Result<Outcome> {
@@ -616,29 +689,49 @@ impl Engine {
         let (where_sql, args) = filter_sql(q);
         let ids = ranked.iter().map(|r| r.0.to_string()).collect::<Vec<_>>().join(",");
         let sql = format!(
-            "SELECT id, path, name, kind, COALESCE(taken, mtime), thumb FROM files WHERE id IN ({ids}) {where_sql}"
+            "SELECT id, path, name, kind, COALESCE(taken, mtime), thumb, duration FROM files WHERE id IN ({ids}) {where_sql}"
         );
-        let mut rows: HashMap<i64, (String, String, String, i64, Option<String>)> = HashMap::new();
+        let mut rows: HashMap<i64, FileRow> = HashMap::new();
         let mut stmt = conn.prepare(&sql)?;
         let mapped = stmt.query_map(params_from_iter(args), |r| {
-            Ok((r.get::<_, i64>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+            Ok((r.get::<_, i64>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))
         })?;
         for row in mapped {
             let (id, v) = row?;
             rows.insert(id, v);
         }
-        let mut chunk_stmt = conn.prepare_cached("SELECT text, line FROM chunks WHERE id=?1")?;
+        let mut chunk_stmt =
+            conn.prepare_cached("SELECT text, line, source, page, start_ms FROM chunks WHERE id=?1")?;
         let mut hits = Vec::new();
         for &(id, score, chunk, sig) in ranked {
-            let Some((path, name, kind, date, thumb)) = rows.remove(&id) else { continue };
-            let (snippet, line) = match chunk {
+            let Some((path, name, kind, date, thumb, duration)) = rows.remove(&id) else { continue };
+            let found = match chunk {
                 Some(c) => chunk_stmt
-                    .query_row([c], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
-                    .optional()?
-                    .map(|(t, l)| (Some(snippet(&t, toks)), Some(l)))
-                    .unwrap_or((None, None)),
-                None => (None, None),
+                    .query_row([c], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, i64>(2)?,
+                            r.get::<_, Option<i64>>(3)?,
+                            r.get::<_, Option<i64>>(4)?,
+                        ))
+                    })
+                    .optional()?,
+                None => None,
             };
+            let (mut snippet_text, mut line, mut page, mut at_ms, mut source) = (None, None, None, None, None);
+            if let Some((text, l, src, p, ms)) = found {
+                snippet_text = Some(snippet(&text, toks));
+                // Line numbers mean something only in the file's own text.
+                line = (src == db::SOURCE_TEXT).then_some(l);
+                (page, at_ms) = (p, ms);
+                source = match src {
+                    db::SOURCE_OCR => Some("ocr"),
+                    db::SOURCE_SPEECH => Some("speech"),
+                    db::SOURCE_TAGS => Some("tags"),
+                    _ => None,
+                };
+            }
             let mut why = Vec::new();
             if sig.name {
                 why.push("name");
@@ -649,6 +742,7 @@ impl Engine {
             if sig.semantic {
                 why.push("semantic");
             }
+            why.extend(source);
             hits.push(Hit {
                 file_id: id,
                 dir: display_dir(&path),
@@ -656,8 +750,11 @@ impl Engine {
                 name,
                 kind: Kind::parse(&kind).unwrap_or(Kind::Other),
                 score,
-                snippet,
+                snippet: snippet_text,
                 line,
+                page,
+                at_ms,
+                duration,
                 thumb,
                 date,
                 why,
@@ -733,7 +830,7 @@ impl Engine {
             }
             self.cache_chunk_vectors(&fresh);
             let code_qv = gemma.embed_query(&q.text, CODE_QUERY_PREFIX)?;
-            let (text_level, code_level, _) = self.baseline_levels(conn, &qv, &code_qv);
+            let (text_level, code_level) = self.baseline_levels(conn, &qv, &code_qv);
             // Margin over the unrelated level; without a baseline yet, over the shortlist's own mean
             // (which is higher, so the cut is stricter).
             let mut best: HashMap<i64, (f64, i64)> = HashMap::new();
@@ -789,10 +886,10 @@ impl Engine {
                 None => named || keyword,
             }
         });
+        // Images, recordings and videos found through their text (OCR, transcripts, tags) join
+        // the ones found through their own vectors below.
+        let mut text_media: HashMap<i64, Hit> = HashMap::new();
         for mut h in self.load_hits(conn, q, &toks, &ranked)? {
-            if h.kind == Kind::Image {
-                continue; // images come from the vision index below
-            }
             if let Some(&sim) = gemma_margins.get(&h.file_id) {
                 h.sim = Some(sim as f32);
                 h.why.retain(|w| *w != "semantic");
@@ -804,52 +901,131 @@ impl Engine {
             {
                 h.snippet = f.snippet.clone();
                 h.line = f.line;
-            }
-            hits.push(h);
-        }
-
-        // Images: text-to-image similarity against the vision index.
-        if wants(Kind::Image) && !cancelled() {
-            let knn = knn_rows(conn, "vec_image", &qv, IMAGE_K)?;
-            let sims: Vec<f64> = knn.iter().map(|&(_, d)| 1.0 - d).collect();
-            let (_, _, level) = self.baseline_levels(conn, &qv, &qv);
-            let keep = match level {
-                Some(l) => l + self.cfg.search.image_margin,
-                None => image_threshold(&sims),
-            };
-            let name_hits: std::collections::HashSet<i64> = fast.name_ranked.iter().copied().collect();
-            let mut ranked: Vec<(i64, f64, Option<i64>, Signals)> = knn
-                .iter()
-                .zip(&sims)
-                .filter(|(_, s)| **s >= keep)
-                .map(|(&(f, _), &s)| {
-                    let sig = Signals { name: name_hits.contains(&f), ..Default::default() };
-                    (f, s + if sig.name { 0.05 } else { 0.0 }, None, sig)
-                })
-                .collect();
-            let image_sims: HashMap<i64, f64> =
-                knn.iter().zip(&sims).map(|(&(f, _), &s)| (f, s - level.unwrap_or(0.0))).collect();
-            // Images that matched by name but not by content still belong in the group.
-            for h in fast.hits.iter().filter(|h| h.kind == Kind::Image) {
-                if !ranked.iter().any(|r| r.0 == h.file_id) {
-                    ranked.push((h.file_id, 0.0, None, Signals { name: true, ..Default::default() }));
+                h.page = f.page;
+                h.at_ms = f.at_ms;
+                for w in &f.why {
+                    if ["ocr", "speech", "tags"].contains(w) && !h.why.contains(w) {
+                        h.why.push(w);
+                    }
                 }
             }
-            ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
-            for mut h in self.load_hits(conn, q, &toks, &ranked)? {
-                if h.score > 0.0 {
-                    h.why.push("vision");
-                }
-                h.sim = image_sims.get(&h.file_id).map(|&s| s as f32);
+            if matches!(h.kind, Kind::Image | Kind::Audio | Kind::Video) {
+                text_media.insert(h.file_id, h);
+            } else {
                 hits.push(h);
             }
         }
 
-        let images_pending: i64 = conn
-            .query_row("SELECT count(*) FROM files WHERE vision_state=?1", [db::VISION_PENDING], |r| r.get(0))
-            .unwrap_or(0);
-        let note = (images_pending > 0).then(|| format!("{images_pending} images are still being indexed"));
+        // Images, recordings and videos: text-to-content similarity against their own vectors.
+        let levels = self.media_levels(conn, &qv);
+        let media_knn = if (wants(Kind::Audio) || wants(Kind::Video)) && !cancelled() {
+            media_files(conn, &knn_rows(conn, "vec_media", &qv, MEDIA_K)?)?
+        } else {
+            Vec::new()
+        };
+        for (kind, level, label) in [
+            (Kind::Image, levels.image, "vision"),
+            (Kind::Audio, levels.audio, "audio"),
+            (Kind::Video, levels.video, "vision"),
+        ] {
+            if !wants(kind) || cancelled() {
+                continue;
+            }
+            let knn: Vec<(i64, f64)> = if kind == Kind::Image {
+                knn_rows(conn, "vec_image", &qv, IMAGE_K)?.into_iter().map(|(f, d)| (f, 1.0 - d)).collect()
+            } else {
+                media_knn.iter().filter(|m| m.2 == kind).map(|m| (m.0, m.1)).collect()
+            };
+            hits.extend(self.media_group(conn, q, &toks, fast, kind, label, &knn, level, &mut text_media)?);
+        }
+
+        let note = pending_note(conn);
         Ok(Outcome { stage: Stage::Deep, hits, elapsed_ms: started.elapsed().as_secs_f64() * 1000.0, note, ..empty() })
+    }
+
+    /// One group of images, recordings or videos: files whose own vector stands out from the
+    /// unrelated level (`knn`: file id and similarity, best first), merged with those found
+    /// through their text. Both kinds of evidence are scaled so 1.0 is just past the margin.
+    #[allow(clippy::too_many_arguments)]
+    fn media_group(
+        &self,
+        conn: &Connection,
+        q: &Query,
+        toks: &[String],
+        fast: &Outcome,
+        kind: Kind,
+        label: &'static str,
+        knn: &[(i64, f64)],
+        level: Option<(f64, usize)>,
+        text_media: &mut HashMap<i64, Hit>,
+    ) -> Result<Vec<Hit>> {
+        let sims: Vec<f64> = knn.iter().map(|k| k.1).collect();
+        let margin = self.cfg.search.image_margin;
+        let keep = match level {
+            Some((l, n)) if n < BASELINE_MIN => l + margin * BASELINE_SMALL_MARGIN,
+            Some((l, _)) => l + margin,
+            None => image_threshold(&sims),
+        };
+        let unrelated = level.map(|l| l.0).unwrap_or(keep - margin);
+        tracing::debug!(
+            "{kind:?}: level {level:?}, keep {keep:.3}, top {:?}",
+            knn.iter().take(9).map(|(f, s)| format!("{f}:{s:.3}")).collect::<Vec<_>>()
+        );
+        let name_files: std::collections::HashSet<i64> = fast.name_ranked.iter().copied().collect();
+        // file -> (score, similarity over the unrelated level, matched by its own vector)
+        let mut scored: HashMap<i64, (f64, Option<f64>, bool)> = HashMap::new();
+        for &(f, s) in knn {
+            let over = s >= keep;
+            let e = scored.entry(f).or_insert((0.0, None, false));
+            e.1 = Some(s - unrelated);
+            if over {
+                e.0 += 1.0 + (s - keep) / margin;
+                e.2 = true;
+            }
+        }
+        let text_margin = self.cfg.search.text_margin;
+        for h in text_media.values().filter(|h| h.kind == kind) {
+            let text_score = match h.sim {
+                Some(m) => m as f64 / text_margin,
+                None if h.why.contains(&"keyword") => 1.0,
+                None => 0.0,
+            };
+            scored.entry(h.file_id).or_insert((0.0, None, false)).0 += text_score;
+        }
+        // Files that matched by name but not by content still belong in the group.
+        for h in fast.hits.iter().filter(|h| h.kind == kind) {
+            scored.entry(h.file_id).or_insert((0.0, None, false));
+        }
+        scored.retain(|f, e| e.2 || text_media.contains_key(f) || name_files.contains(f));
+        for (f, e) in scored.iter_mut() {
+            if name_files.contains(f) {
+                e.0 += 0.5;
+            }
+        }
+        let fresh: Vec<(i64, f64, Option<i64>, Signals)> = scored
+            .iter()
+            .filter(|(f, _)| !text_media.contains_key(f))
+            .map(|(&f, e)| (f, e.0, None, Signals { name: name_files.contains(&f), ..Default::default() }))
+            .collect();
+        let mut out: Vec<Hit> = self.load_hits(conn, q, toks, &fresh)?;
+        for f in scored.keys() {
+            if let Some(h) = text_media.remove(f) {
+                out.push(h);
+            }
+        }
+        for h in &mut out {
+            let (score, over_level, own) = scored[&h.file_id];
+            h.score = score;
+            if own {
+                h.why.push(label);
+                // Report the content similarity; text matches keep Gemma's text margin.
+                if h.sim.is_none() {
+                    h.sim = over_level.map(|s| s as f32);
+                }
+            }
+        }
+        out.sort_by(|a, b| b.score.total_cmp(&a.score));
+        Ok(out)
     }
 
     /// Best effort: a busy writer just means the vectors get computed again next time.
@@ -946,7 +1122,51 @@ fn image_threshold(sims: &[f64]) -> f64 {
     let mut sorted = sims.to_vec();
     sorted.sort_by(|a, b| a.total_cmp(b));
     let median = sorted[sorted.len() / 2];
+    // Too few neighbours to tell a standout from the only candidate.
+    if sims.len() < BASELINE_SMALL_MIN {
+        return f64::MAX;
+    }
     (top - 0.06).max(median + 0.01).min(top)
+}
+
+/// Best similarity per file from audio/video segment neighbours: (file id, similarity, kind),
+/// best first.
+fn media_files(conn: &Connection, segments: &[(i64, f64)]) -> Result<Vec<(i64, f64, Kind)>> {
+    if segments.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids = segments.iter().map(|s| s.0.to_string()).collect::<Vec<_>>().join(",");
+    let mut owner: HashMap<i64, (i64, Kind)> = HashMap::new();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT s.id, s.file_id, f.kind FROM media_segments s JOIN files f ON f.id=s.file_id WHERE s.id IN ({ids})"
+    ))?;
+    for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)))? {
+        let (seg, file, kind) = row?;
+        owner.insert(seg, (file, Kind::parse(&kind).unwrap_or(Kind::Other)));
+    }
+    let mut out: Vec<(i64, f64, Kind)> = Vec::new();
+    for &(seg, d) in segments {
+        let Some(&(file, kind)) = owner.get(&seg) else { continue };
+        if !out.iter().any(|o| o.0 == file) {
+            out.push((file, 1.0 - d, kind));
+        }
+    }
+    Ok(out)
+}
+
+/// "N images are still being indexed", while the slower lanes have work left.
+fn pending_note(conn: &Connection) -> Option<String> {
+    let count = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap_or(0);
+    let images = count(&format!("SELECT count(*) FROM files WHERE vision_state={}", db::VISION_PENDING));
+    let media = count(&format!("SELECT count(*) FROM files WHERE media_state={}", db::EXTRA_PENDING));
+    let mut parts = Vec::new();
+    if images > 0 {
+        parts.push(format!("{images} images"));
+    }
+    if media > 0 {
+        parts.push(format!("{media} recordings and videos"));
+    }
+    (!parts.is_empty()).then(|| format!("{} are still being indexed", parts.join(" and ")))
 }
 
 /// Files whose name has every query word as a word prefix ("tax 23" finds

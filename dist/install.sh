@@ -29,8 +29,18 @@ if [ ! -f "$conf" ]; then
     "$bin_dir/omafind" config >"$conf"
 fi
 
-echo "==> Fetching models (verified by SHA-256; about 370 MB)"
+echo "==> Fetching models (verified by SHA-256; about 770 MB)"
 "$bin_dir/omafind" models fetch
+
+# Optional tools: without them, images, scans, recordings and videos are found by name only.
+missing=""
+command -v tesseract >/dev/null 2>&1 || missing="$missing tesseract (text in images and scans)"
+command -v ffmpeg >/dev/null 2>&1 || missing="$missing, ffmpeg (audio and video)"
+command -v whisper-cli >/dev/null 2>&1 || missing="$missing, whisper-cpp (speech)"
+if [ -n "$missing" ]; then
+    echo "==> Optional tools not found:${missing#,}"
+    echo "    On Arch: sudo pacman -S --needed tesseract tesseract-data-eng ffmpeg whisper-cpp"
+fi
 
 if [ "${NO_SERVICE:-0}" != 1 ]; then
     echo "==> Installing the systemd user service"

@@ -4,7 +4,9 @@
 
 Find files on Linux by what is in them. Type "the email about the lease renewal",
 "sourdough starter" or "mountains at sunset" and omafind finds the document, the note or
-the photo, even if its file name is `IMG_4021.HEIC` or `scan0003.pdf`.
+the photo, even if its file name is `IMG_4021.HEIC` or `scan0003.pdf`. It also reads the
+text in screenshots and scans, and finds recordings and videos by what is said or shown
+in them.
 
 Everything runs on your machine. omafind indexes your files into one local SQLite file
 and searches it in two tiers:
@@ -13,9 +15,9 @@ and searches it in two tiers:
   embeddings ([Model2Vec](https://github.com/MinishLab/model2vec)) for every chunk of
   every document. Typically 15–45 ms on a million-chunk index.
 - **Deep (when you pause):** [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2)
-  re-scores the top 100 text candidates and searches photos with its vision encoder.
-  There is no captioning step: images and queries share one embedding space. Deep
-  results stream in after the instant ones.
+  re-scores the top 100 text candidates and searches photos, videos and recordings with
+  its vision and audio encoders. There is no captioning step: images, sound and queries
+  share one embedding space. Deep results stream in after the instant ones.
 
 The first release targets Linux and [Omarchy](https://omarchy.org): a CLI, a background
 daemon and a launcher plugin for the Omarchy shell.
@@ -24,17 +26,20 @@ daemon and a launcher plugin for the Omarchy shell.
 
 ### From source (any distribution)
 
-You need Rust 1.90+, libheif and poppler (`pdftotext`):
+You need Rust 1.90+, libheif and poppler (`pdftotext`). Optional tools add more:
+Tesseract reads text in images and scans, FFmpeg opens audio and video, and whisper.cpp
+transcribes speech. Without them those files are found by name and tags only.
 
 ```sh
-sudo pacman -S --needed rust libheif poppler    # Arch / Omarchy
+sudo pacman -S --needed rust libheif poppler                         # Arch / Omarchy
+sudo pacman -S --needed tesseract tesseract-data-eng ffmpeg whisper-cpp  # optional
 git clone https://github.com/CanadaApollo6/omafind && cd omafind
 dist/install.sh
 ```
 
 The script does the following:
 - Builds omafind and installs `~/.local/bin/omafind`.
-- Downloads the models (~370 MB, pinned and checked by SHA-256).
+- Downloads the models (~770 MB, pinned and checked by SHA-256). `omafind models fetch --no-audio --no-speech` skips the audio encoder and Whisper (~370 MB).
 - Writes `~/.config/omafind/config.toml`.
 - Enables the `omafind` systemd user service, which builds the index in the background.
 - On Omarchy, installs and enables the **Find** launcher plugin.
@@ -65,7 +70,7 @@ omarchy plugin enable omafind.search
 
 ```sh
 omafind status                               # index and daemon state
-omafind search lease renewal email           # grouped results: documents, code, images
+omafind search lease renewal email           # grouped results: documents, code, images, audio, video
 omafind search kind:image dog on the beach
 omafind search "tax return" after:2024-01 ext:pdf
 omafind search --names invoice 2023          # file names only
@@ -77,7 +82,7 @@ Filters can be mixed with words:
 
 | Filter | Meaning |
 |---|---|
-| `kind:image` (`document`, `code`, `image`), also `type:` / `is:` | one kind of file |
+| `kind:image` (`document`, `code`, `image`, `audio`, `video`), also `type:` / `is:` | one kind of file |
 | `ext:pdf` | file extension |
 | `after:2024-03`, `since:2w`, `before:2023`, `until:3d`, `year:2022` | modified (photos: taken) date |
 | `in:~/Documents`, `path:work` | folder |
@@ -107,7 +112,17 @@ In the launcher:
   - Word/Writer, PowerPoint/Impress, Excel/Calc and EPUB.
 - **Code:** about 60 languages plus Makefiles, Dockerfiles, PKGBUILDs and similar. Code uses a code-specific static model.
 - **Images:** JPEG, PNG, WebP, GIF, TIFF, BMP, AVIF and JPEG XL. HEIC/HEIF through libheif. Camera RAW (CR2/CR3, NEF, ARW, DNG, ORF, RW2, RAF and more) through the embedded preview.
-- **Not yet:** audio and video are recognised and searchable by name only.
+- **Text in images and scans** (with Tesseract):
+  - Screenshots, scans and other images are read with OCR. Only words Tesseract is confident about are kept, so a landscape doesn't fill the index with noise.
+  - Camera photos are read only when Gemma finds them text-like (a receipt, a sign, a whiteboard). That saves a second or more per holiday photo.
+  - PDF pages without a text layer are rendered and read (up to 50 pages per file). Results show the page.
+  - Languages: English plus your locale's language if its Tesseract data is installed (`indexing.ocr_languages`).
+- **Audio and video** (with FFmpeg):
+  - Tags (title, artist, album, show, comment) are searchable straight away.
+  - Gemma's audio encoder embeds up to four 30-second windows of each recording, so "rain on a tin roof" or "a man giving a speech" can match.
+  - Videos are embedded from frames sampled across the clip (16 on the CPU, 32 with CUDA).
+  - Speech is transcribed with [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (any language, with voice activity detection). Results show where in the recording the words are. Music is not transcribed, and only the first two hours of a file are (`indexing.speech_max_minutes`).
+  - `indexing.speech_model` picks `base` (default, 60 MB), `small` or `large-v3-turbo` for better transcripts at more CPU time.
 
 By default omafind indexes your home folder. It respects `.gitignore` and skips hidden
 files and caches (Trash, browser profiles, package caches, `node_modules`, build output).
@@ -139,7 +154,8 @@ omafind is built to run all the time without being noticed.
 
 - **Indexing pace:**
   - The indexer runs at low CPU and I/O priority and pauses while the machine is busy (load above 75%).
-  - On battery it only does cheap text work by default. Gemma work waits for the charger (`indexing.on_battery`).
+  - On battery it only does cheap text work by default. Gemma, OCR and transcription wait for the charger (`indexing.on_battery`).
+  - The slow lanes (image and text vectors, OCR, audio and video, transcripts) take turns, a few files at a time, and give way as soon as a file changes.
 - **Memory:**
   - The daemon idles at about 185 MB with the static models loaded.
   - Gemma (q4 on CPU) adds 500–700 MB while it embeds or searches, and is unloaded after 5 idle minutes.
@@ -162,6 +178,9 @@ behind the "hard parts" of local semantic search.
   | No-change rescan | 0.2 s |
   | Fast search, through the daemon | 13–44 ms |
 - **Images** go through the Gemma vision encoder at ~0.85 s each on the CPU (140 tokens), so 1,000 photos take about 15 minutes of background time. Text search works during that time; images join the results as they are embedded. With CUDA the encoder is much faster and uses 280 tokens.
+- **OCR** takes about 0.4 s per screenshot or scanned page.
+- **Audio and video:** about 0.7 s per 30-second audio window. Videos cost about 0.65 s per sampled frame (70 tokens each, decoding included), so 5–10 s per clip.
+- **Transcripts:** Whisper base handles speech at about 30× real time on 8 threads: an hour of recordings takes about two minutes.
 - **Gemma text vectors** are precomputed in the background as well (~85 ms per chunk on the CPU). Until a chunk has one, deep search embeds it on demand within a time budget (`search.rescore_budget_ms`).
 
 **Search quality.** `eval/` holds a synthetic corpus of 45 personal files:
@@ -184,7 +203,8 @@ the corpus. Reproduce with `omafind eval --corpus eval/corpus --queries eval/que
 - **Shown results:** the deep tier also shows far fewer results, because it only shows files clearly above the query's "unrelated" level. The five negative queries return nothing.
 - **Precomputed vectors:** the table assumes the background job has already computed Gemma vectors.
 - **Right after indexing** (`--cold`), deep search embeds candidates on demand within its budget. It then scores Hit@1 0.88, Hit@10 0.98 and MRR 0.923, at 225 ms mean and 273 ms p95, and the negative queries still show nothing.
-- **Coverage:** image search was checked by hand on a folder of wallpapers. The labelled eval covers documents and code only.
+- **Coverage:** image, audio and video search and OCR were checked by hand on wallpapers and synthetic test files. The labelled eval covers documents and code only.
+- **Gemma's audio and video vectors** match the model card's reference similarities to within 0.005, and the mel features are a line-by-line port of the reference feature extractor.
 
 **How the instant tier stays fast:**
 - Every chunk's static vector is stored twice: as int8 for exact scoring, and as 256 sign bits.
@@ -197,9 +217,10 @@ the corpus. Reproduce with `omafind eval --corpus eval/corpus --queries eval/que
 ```
                       ┌────────────── omafind daemon (systemd user service) ───────────────┐
  files ── inotify ──▶ │ extract ─▶ chunk ─▶ static embed ─▶ SQLite: files, chunks,         │
-                      │   (text, PDF, Office, images)        FTS5, static vectors,         │
-                      │                                      Gemma text and image vectors  │
-                      │ idle or plugged in: Gemma vision for images, Gemma text for chunks │
+                      │   (text, PDF, Office,                FTS5, static vectors, Gemma   │
+                      │    images, media tags)               text, image and media vectors │
+                      │ idle or plugged in, taking turns: Gemma vision for images, OCR,    │
+                      │ Gemma audio and video, Whisper transcripts, Gemma text for chunks  │
                       └──────────▲─────────────────────────────────────────────────────────┘
  launcher / CLI ── Unix socket ──┘   query ─▶ instant tier ─▶ (pause) ─▶ deep tier
 ```
@@ -207,7 +228,7 @@ the corpus. Reproduce with `omafind eval --corpus eval/corpus --queries eval/que
 | Piece | Where |
 |---|---|
 | Crawl, inotify watches, change detection, power and load throttling | `src/index.rs`, `src/daemon.rs`, `src/power.rs` |
-| Extraction and chunking | `src/extract/`, `src/chunk.rs` |
+| Extraction and chunking; OCR, FFmpeg and Whisper (as child processes) | `src/extract/`, `src/chunk.rs` |
 | Static models and EmbeddingGemma 2 (ONNX Runtime) | `src/embed/` |
 | Index schema | `src/db.rs` |
 | In-memory static vector index | `src/vecindex.rs` |
@@ -215,8 +236,8 @@ the corpus. Reproduce with `omafind eval --corpus eval/corpus --queries eval/que
 | Launcher plugin (Quickshell / QML) | `dist/omarchy/omafind.search/` |
 
 **Model details:**
-- EmbeddingGemma 2 runs from the [ONNX export](https://huggingface.co/onnx-community/embeddinggemma-2-ONNX), text and vision encoders only.
-- It uses 4-bit weights on the CPU (`models.precision`) and fp32 on CUDA.
+- EmbeddingGemma 2 runs from the [ONNX export](https://huggingface.co/onnx-community/embeddinggemma-2-ONNX): text, vision and audio encoders.
+- It uses 4-bit weights on the CPU (`models.precision`) and fp32 on CUDA. The audio encoder uses 8-bit weights next to a 4-bit text model, because 4-bit costs audio the most quality.
 - Vectors are shortened to 256 dimensions (Matryoshka, `models.dim`).
 
 **Relevance:** raw similarity scores drift from query to query. For each query, omafind
@@ -226,17 +247,15 @@ above that level. Tune with `search.text_margin` and `search.image_margin`.
 ## Roadmap
 
 - **Phase 2:**
-  - OCR for scanned PDFs and screenshots.
-  - Audio and video: speech-to-text, plus Gemma's audio encoder.
   - Richer previews.
   - Labels for people and pets.
 - External and removable drives with their own index.
-- A standalone Tauri app.
 
 ## License
 
 Apache License 2.0; see [LICENSE](LICENSE). The models are not part of this repository
-and have their own licenses: EmbeddingGemma 2 is Apache 2.0, the Model2Vec models are MIT.
+and have their own licenses: EmbeddingGemma 2 is Apache 2.0; the Model2Vec models, Whisper
+and Silero VAD are MIT.
 See [NOTICE](NOTICE).
 
 Created in [T3 Code](https://t3.codes).

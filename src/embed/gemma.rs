@@ -1,9 +1,10 @@
 //! Deep tier: EmbeddingGemma 2 through ONNX Runtime.
 //!
-//! Only the text model and the vision encoder are loaded (the audio encoder is not), which
-//! is the 440M-parameter text+image configuration. Images go through the vision encoder,
-//! and its soft tokens are placed at `<|image|>` positions in the text model, so image
-//! and text vectors share one space and can be compared directly.
+//! The text model is always loaded; the vision and audio encoders are loaded when an image,
+//! video or recording needs them and dropped again when the indexer runs out of work.
+//! Images and video frames go through the vision encoder and recordings through the audio
+//! encoder; their soft tokens are placed at `<|image|>`, `<|video|>` and `<|audio|>`
+//! positions in the text model, so all vectors share one space and can be compared directly.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -27,6 +28,12 @@ const PAD: i64 = 0;
 const BOI: i64 = 255_999;
 const EOI: i64 = 258_882;
 const IMAGE_TOKEN: i64 = 258_880;
+const BOA: i64 = 256_000;
+const AUDIO_TOKEN: i64 = 258_881;
+const EOA: i64 = 258_883;
+const VIDEO_TOKEN: i64 = 258_884;
+/// Longest stretch of audio the encoder sees at once (the feature extractor's default cap).
+pub const AUDIO_WINDOW_SECS: f64 = 30.0;
 const HIDDEN: usize = 512;
 const PATCH: usize = 16;
 const POOL: usize = 3;
@@ -35,6 +42,7 @@ const BATCH: usize = 16;
 pub struct Gemma {
     text: Mutex<Session>,
     vision: Mutex<Option<Session>>,
+    audio: Mutex<Option<Session>>,
     tokenizer: Tokenizer,
     dir: PathBuf,
     suffix: &'static str,
@@ -45,6 +53,10 @@ pub struct Gemma {
     pub dim: usize,
     /// Soft tokens per image.
     pub vision_tokens: u32,
+    /// Soft tokens per video frame.
+    pub video_tokens: u32,
+    /// The audio encoder's graph, if it was downloaded.
+    audio_path: Option<PathBuf>,
 }
 
 /// q4 is the fastest on CPU at a small quality cost; on a GPU fp32 is fast anyway.
@@ -72,7 +84,7 @@ impl Gemma {
         let precision = precision_for(&cfg.models.precision, cuda);
         let dir = models::find_gemma(&precision)?;
         let suffix = models::precision_suffix(&precision);
-        let threads = if cfg.models.threads > 0 { cfg.models.threads } else { (config::num_cpus() / 2).clamp(1, 8) };
+        let threads = threads(cfg);
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| anyhow!("tokenizer: {e}"))?;
         let text = session(&dir.join(format!("onnx/model{suffix}.onnx")), threads, cuda)?;
         let vision_tokens = match cfg.models.vision_tokens {
@@ -83,7 +95,9 @@ impl Gemma {
         Ok(Self {
             text: Mutex::new(text),
             vision: Mutex::new(None),
+            audio: Mutex::new(None),
             tokenizer,
+            audio_path: models::find_gemma_audio(&precision),
             dir,
             suffix,
             threads,
@@ -91,6 +105,7 @@ impl Gemma {
             precision,
             dim: cfg.models.dim,
             vision_tokens,
+            video_tokens: if cuda { 140 } else { 70 },
         })
     }
 
@@ -134,7 +149,7 @@ impl Gemma {
                 mask.extend(std::iter::repeat_n(1i64, ids.len()));
                 mask.extend(std::iter::repeat_n(0i64, len - ids.len()));
             }
-            let vecs = run_text(&mut session, [batch.len(), len], input_ids, mask, None)?;
+            let vecs = run_text(&mut session, [batch.len(), len], input_ids, mask, Media::default())?;
             for ((i, _), v) in batch.iter().zip(vecs) {
                 out[*i] = truncate_normalize(&v, self.dim);
             }
@@ -146,42 +161,114 @@ impl Gemma {
         Ok(self.embed_texts(&[format!("{prefix}{query}")], 256)?.remove(0))
     }
 
-    /// Embeds one image into the shared text/image space.
+    /// Embeds one image into the shared space.
     pub fn embed_image(&self, img: &DynamicImage) -> Result<Vec<f32>> {
         let prep = preprocess(img, self.vision_tokens);
+        let n = prep.positions.len() / 2;
+        let features = self.encode_frames(1, n, prep.pixels, prep.positions)?;
+        let soft = features.len() / HIDDEN;
+        let mut ids = vec![BOS, BOI];
+        ids.extend(std::iter::repeat_n(IMAGE_TOKEN, soft));
+        ids.extend([EOI, EOS]);
+        self.embed_media(ids, Media { image: features, ..Default::default() })
+    }
+
+    /// Embeds a video from frames sampled across it (about one per second, as in training).
+    pub fn embed_video(&self, frames: &[DynamicImage]) -> Result<Vec<f32>> {
+        anyhow::ensure!(!frames.is_empty(), "no frames");
+        // Frames of one video share a size, so they go through the encoder as one batch.
+        let mut pixels = Vec::new();
+        let mut positions = Vec::new();
+        let mut n = 0;
+        let first = (frames[0].width(), frames[0].height());
+        for f in frames {
+            let f = if (f.width(), f.height()) == first {
+                std::borrow::Cow::Borrowed(f)
+            } else {
+                std::borrow::Cow::Owned(f.resize_exact(first.0, first.1, image::imageops::FilterType::Triangle))
+            };
+            let prep = preprocess(&f, self.video_tokens);
+            n = prep.positions.len() / 2;
+            pixels.extend(prep.pixels);
+            positions.extend(prep.positions);
+        }
+        let features = self.encode_frames(frames.len(), n, pixels, positions)?;
+        let per_frame = features.len() / HIDDEN / frames.len();
+        let mut ids = vec![BOS];
+        for _ in frames {
+            ids.push(BOI);
+            ids.extend(std::iter::repeat_n(VIDEO_TOKEN, per_frame));
+            ids.push(EOI);
+        }
+        ids.push(EOS);
+        self.embed_media(ids, Media { video: features, ..Default::default() })
+    }
+
+    /// Whether recordings can be embedded (the audio encoder was downloaded).
+    pub fn has_audio(&self) -> bool {
+        self.audio_path.is_some()
+    }
+
+    /// Embeds up to `AUDIO_WINDOW_SECS` of 16 kHz mono audio.
+    pub fn embed_audio(&self, samples: &[f32]) -> Result<Vec<f32>> {
+        let max = (AUDIO_WINDOW_SECS * 16_000.0) as usize;
+        let feats = super::audio::features(&samples[..samples.len().min(max)]);
+        anyhow::ensure!(feats.tokens() > 0, "audio too short");
+        let frames = feats.frames();
         let features = {
-            let mut guard = self.vision.lock().unwrap();
+            let mut guard = self.audio.lock().unwrap();
             if guard.is_none() {
-                let path = self.dir.join(format!("onnx/vision_encoder{}.onnx", self.suffix));
-                *guard = Some(session(&path, self.threads, self.cuda)?);
+                let path = self.audio_path.as_ref().context("the audio encoder is not installed")?;
+                *guard = Some(session(path, self.threads, self.cuda)?);
             }
-            let vision = guard.as_mut().unwrap();
-            let n = prep.positions.len() / 2;
-            let outputs = vision.run(ort::inputs! {
-                "pixel_values" => Tensor::from_array(([1usize, n, PATCH * PATCH * 3], prep.pixels))?,
-                "pixel_position_ids" => Tensor::from_array(([1usize, n, 2], prep.positions))?,
+            let audio = guard.as_mut().unwrap();
+            let outputs = audio.run(ort::inputs! {
+                "input_features" => Tensor::from_array(([1usize, frames, super::audio::MELS], feats.mel))?,
+                "input_features_mask" => Tensor::from_array(([1usize, frames], feats.mask))?,
             })?;
-            let (shape, data) = outputs["image_features"].try_extract_tensor::<f32>()?;
+            let (shape, data) = outputs["audio_features"].try_extract_tensor::<f32>()?;
             anyhow::ensure!(
                 shape.len() == 2 && shape[1] as usize == HIDDEN,
-                "unexpected image_features shape {shape:?}"
+                "unexpected audio_features shape {shape:?}"
             );
             data.to_vec()
         };
         let soft = features.len() / HIDDEN;
-        let mut ids = Vec::with_capacity(soft + 4);
-        ids.extend([BOS, BOI]);
-        ids.extend(std::iter::repeat_n(IMAGE_TOKEN, soft));
-        ids.extend([EOI, EOS]);
+        let mut ids = vec![BOS, BOA];
+        ids.extend(std::iter::repeat_n(AUDIO_TOKEN, soft));
+        ids.extend([EOA, EOS]);
+        self.embed_media(ids, Media { audio: features, ..Default::default() })
+    }
+
+    /// Runs the vision encoder over `frames` images of `n` patches each.
+    fn encode_frames(&self, frames: usize, n: usize, pixels: Vec<f32>, positions: Vec<i64>) -> Result<Vec<f32>> {
+        let mut guard = self.vision.lock().unwrap();
+        if guard.is_none() {
+            let path = self.dir.join(format!("onnx/vision_encoder{}.onnx", self.suffix));
+            *guard = Some(session(&path, self.threads, self.cuda)?);
+        }
+        let vision = guard.as_mut().unwrap();
+        let outputs = vision.run(ort::inputs! {
+            "pixel_values" => Tensor::from_array(([frames, n, PATCH * PATCH * 3], pixels))?,
+            "pixel_position_ids" => Tensor::from_array(([frames, n, 2], positions))?,
+        })?;
+        let (shape, data) = outputs["image_features"].try_extract_tensor::<f32>()?;
+        anyhow::ensure!(shape.len() == 2 && shape[1] as usize == HIDDEN, "unexpected image_features shape {shape:?}");
+        Ok(data.to_vec())
+    }
+
+    fn embed_media(&self, ids: Vec<i64>, media: Media) -> Result<Vec<f32>> {
         let len = ids.len();
         let mut session = self.text.lock().unwrap();
-        let v = run_text(&mut session, [1, len], ids, vec![1; len], Some(features))?;
+        let v = run_text(&mut session, [1, len], ids, vec![1; len], media)?;
         Ok(truncate_normalize(&v[0], self.dim))
     }
 
-    /// Frees the vision encoder (it is reloaded on the next image).
-    pub fn unload_vision(&self) {
-        if self.vision.lock().unwrap().take().is_some() {
+    /// Frees the vision and audio encoders (they are reloaded when needed).
+    pub fn unload_encoders(&self) {
+        let vision = self.vision.lock().unwrap().take().is_some();
+        let audio = self.audio.lock().unwrap().take().is_some();
+        if vision || audio {
             super::release_memory();
         }
     }
@@ -253,21 +340,28 @@ fn session(path: &Path, threads: usize, cuda: bool) -> Result<Session> {
     builder.commit_from_file(path).with_context(|| format!("loading {}", path.display()))
 }
 
+/// Encoder outputs placed at the matching soft-token positions, each [tokens, HIDDEN].
+#[derive(Default)]
+struct Media {
+    image: Vec<f32>,
+    video: Vec<f32>,
+    audio: Vec<f32>,
+}
+
 fn run_text(
     session: &mut Session,
     shape: [usize; 2],
     input_ids: Vec<i64>,
     mask: Vec<i64>,
-    image_features: Option<Vec<f32>>,
+    media: Media,
 ) -> Result<Vec<Vec<f32>>> {
-    let image_features = image_features.unwrap_or_default();
-    let n_img = image_features.len() / HIDDEN;
+    let rows = |v: &Vec<f32>| v.len() / HIDDEN;
     let outputs = session.run(ort::inputs! {
         "input_ids" => Tensor::from_array((shape, input_ids))?,
         "attention_mask" => Tensor::from_array((shape, mask))?,
-        "image_features" => Tensor::from_array(([n_img, HIDDEN], image_features))?,
-        "video_features" => Tensor::from_array(([0usize, HIDDEN], Vec::<f32>::new()))?,
-        "audio_features" => Tensor::from_array(([0usize, HIDDEN], Vec::<f32>::new()))?,
+        "image_features" => Tensor::from_array(([rows(&media.image), HIDDEN], media.image))?,
+        "video_features" => Tensor::from_array(([rows(&media.video), HIDDEN], media.video))?,
+        "audio_features" => Tensor::from_array(([rows(&media.audio), HIDDEN], media.audio))?,
     })?;
     let (out_shape, data) = outputs["sentence_embedding"].try_extract_tensor::<f32>()?;
     let width = *out_shape.last().context("empty output shape")? as usize;
@@ -282,6 +376,11 @@ pub fn truncate_normalize(v: &[f32], dim: usize) -> Vec<f32> {
         out.iter_mut().for_each(|x| *x /= norm);
     }
     out
+}
+
+/// Threads for model inference: `models.threads`, or half the cores (at most 8).
+pub fn threads(cfg: &Config) -> usize {
+    if cfg.models.threads > 0 { cfg.models.threads } else { (config::num_cpus() / 2).clamp(1, 8) }
 }
 
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {

@@ -14,3 +14,7 @@ their own licenses:
   https://ai.google.dev/gemma/prohibited_use_policy
 - potion-base-8M and potion-code-16M-v2 by Minish Lab (minishlab/potion-base-8M,
   minishlab/potion-code-16M-v2). MIT License.
+- Whisper by OpenAI, in the ggml format published with whisper.cpp
+  (ggerganov/whisper.cpp). MIT License.
+- Silero VAD by Silero Team, in the ggml format published by ggml-org
+  (ggml-org/whisper-vad). MIT License.

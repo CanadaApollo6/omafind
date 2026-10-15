@@ -68,6 +68,20 @@ pub struct IndexingConfig {
     pub thumbnails: bool,
     /// Full rescan interval for the daemon, in hours (catches missed events).
     pub rescan_hours: u64,
+    /// Read text in screenshots, photos of documents and scanned PDFs (needs `tesseract`).
+    pub ocr: bool,
+    /// Tesseract languages, such as `["eng", "deu"]`. Empty: English plus the locale's language.
+    pub ocr_languages: Vec<String>,
+    /// Embed recordings with Gemma's audio encoder (needs `ffmpeg`).
+    pub audio: bool,
+    /// Embed videos from frames sampled across them (needs `ffmpeg`).
+    pub video: bool,
+    /// Transcribe speech in recordings and videos (needs `whisper-cli` from whisper.cpp).
+    pub speech: bool,
+    /// Whisper model: "base", "small" or "large-v3-turbo".
+    pub speech_model: String,
+    /// Transcribe at most this many minutes of each recording.
+    pub speech_max_minutes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +173,13 @@ impl Default for IndexingConfig {
             threads: 0,
             thumbnails: true,
             rescan_hours: 12,
+            ocr: true,
+            ocr_languages: Vec::new(),
+            audio: true,
+            video: true,
+            speech: true,
+            speech_model: "base".into(),
+            speech_max_minutes: 120,
         }
     }
 }
@@ -206,6 +227,10 @@ impl Config {
         anyhow::ensure!(
             matches!(self.indexing.on_battery.as_str(), "full" | "text" | "pause"),
             "indexing.on_battery must be full, text or pause"
+        );
+        anyhow::ensure!(
+            crate::models::whisper_file(&self.indexing.speech_model).is_some(),
+            "indexing.speech_model must be base, small or large-v3-turbo"
         );
         Ok(())
     }
@@ -335,6 +360,13 @@ max_load = 0.75
 threads = 0
 thumbnails = true
 rescan_hours = 12
+ocr = true                # text in screenshots and scans (needs tesseract)
+ocr_languages = []        # e.g. ["eng", "deu"]; empty = English plus your locale's language
+audio = true              # recordings through Gemma's audio encoder (needs ffmpeg)
+video = true              # videos through frames sampled across them (needs ffmpeg)
+speech = true             # transcripts of speech (needs whisper-cli from whisper.cpp)
+speech_model = "base"     # base | small | large-v3-turbo
+speech_max_minutes = 120
 
 [search]
 rescore_top = 100
